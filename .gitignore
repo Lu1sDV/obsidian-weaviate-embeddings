@@ -1,0 +1,12 @@
+node_modules/
+dist/
+release/
+.runtime/
+.venv/
+__pycache__/
+*.pyc
+.env
+AGENTS.md
+.omp/
+.omc/
+.claude/

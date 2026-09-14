@@ -1,0 +1,23 @@
+services:
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.39.3
+    command: ["--host", "0.0.0.0", "--port", "8080", "--scheme", "http"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ${LOCAL_SEMANTIC_DATA_DIR:-./.runtime/weaviate}:/var/lib/weaviate
+    restart: unless-stopped
+    environment:
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "false"
+      AUTHENTICATION_APIKEY_ENABLED: "true"
+      AUTHENTICATION_APIKEY_ALLOWED_KEYS: ${WEAVIATE_API_KEY:?set WEAVIATE_API_KEY}
+      AUTHENTICATION_APIKEY_USERS: local-semantic-search
+      AUTHORIZATION_ENABLE_RBAC: "false"
+      AUTHORIZATION_ADMINLIST_ENABLED: "true"
+      AUTHORIZATION_ADMINLIST_USERS: local-semantic-search
+      AUTOSCHEMA_ENABLED: "false"
+      DEFAULT_VECTORIZER_MODULE: none
+      DISABLE_TELEMETRY: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      QUERY_DEFAULTS_LIMIT: "100"
+      CLUSTER_HOSTNAME: local-semantic-search

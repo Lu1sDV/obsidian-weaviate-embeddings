@@ -1,0 +1,29 @@
+{
+  "name": "obsidian-local-semantic-search",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.mjs production",
+    "dev": "node esbuild.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --tsconfig tests/tsconfig.json --test tests/*.test.ts",
+    "package": "npm run build && node scripts/package-worker.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "builtin-modules": "^5.0.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "^1.8.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.2.0",
+    "ignore": "7.0.5"
+  },
+  "overrides": {
+    "adm-zip": "0.6.1",
+    "sharp": "0.35.4"
+  }
+}

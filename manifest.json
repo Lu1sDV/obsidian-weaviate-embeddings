@@ -1,0 +1,10 @@
+{
+  "id": "local-semantic-search",
+  "name": "Local Semantic Search",
+  "version": "1.0.0",
+  "minAppVersion": "1.7.0",
+  "description": "Local related-note connections and hybrid search with selectable local embedding models and Weaviate.",
+  "author": "Lu1sDV",
+  "authorUrl": "https://github.com/Lu1sDV",
+  "isDesktopOnly": true
+}
