@@ -8,6 +8,7 @@ import { canonicalJson, PropertyRegistry } from "./properties";
 import { SimilarityGraph, type GraphSelection } from "./similarity-graph";
 import type { PersistedState, PropertyFilter, PropertyKind, SearchResult } from "./types";
 import { WeaviateClient } from "./weaviate";
+import type { JevReranker } from "./reranking";
 
 export const VIEW_TYPE = "local-semantic-search";
 type Mode = "connections" | "search";
@@ -30,6 +31,7 @@ export class SemanticSearchView extends ItemView {
   private results: SearchResult[] = [];
   private context: QueryContext | undefined;
   private requestEpoch = 0;
+  private rerankController: AbortController | undefined;
   private searchTimer: number | undefined;
   private queryActive = false;
   private activeQueryEpoch: number | undefined;
@@ -68,6 +70,7 @@ export class SemanticSearchView extends ItemView {
     private readonly persist: () => Promise<void>,
     private readonly pathPolicy: PathPolicy,
     private edgeCutoff: number,
+    private readonly reranker?: JevReranker,
   ) { super(leaf); }
 
   getViewType(): string { return VIEW_TYPE; }
@@ -126,6 +129,10 @@ export class SemanticSearchView extends ItemView {
   setEdgeCutoff(cutoff: number): void {
     this.edgeCutoff = cutoff;
     this.graph?.setCutoff(cutoff);
+  }
+
+  rerankingChanged(): void {
+    if (this.mode === "search") this.requestRefresh();
   }
 
   private buildControls(): void {
@@ -387,6 +394,8 @@ export class SemanticSearchView extends ItemView {
   }
 
   private cancelRequests(): void {
+    this.rerankController?.abort();
+    this.rerankController = undefined;
     this.requestEpoch++;
     this.inspectionEpoch++;
     this.pendingInspection = undefined;
@@ -509,12 +518,31 @@ export class SemanticSearchView extends ItemView {
         exhausted = limit === 1200;
       }
       if (!this.contextCurrent(context) || !results.every((result) => this.resultCurrent(result, context))) return;
-      // Only final listed notes (plus a real reference) enter the graph fetch.
-      const members = context.anchor ? [context.anchor, ...results] : results;
       for (const result of results) {
         const file = this.app.vault.getAbstractFileByPath(result.path);
         if (file instanceof TFile) result.title = file.basename;
       }
+      let reranked = false;
+      let rerankWarning: string | undefined;
+      // Rerank only the already-admitted Search shortlist; never send the Connections reference.
+      if (mode === "search" && this.reranker) {
+        const controller = new AbortController();
+        this.rerankController = controller;
+        try {
+          const outcome = await this.reranker.rerank(query, results, {
+            signal: controller.signal,
+            isCurrent: () => this.contextCurrent(context) && results.every(result => this.resultCurrent(result, context)),
+          });
+          if (!this.contextCurrent(context) || !results.every(result => this.resultCurrent(result, context))) return;
+          results = outcome.results;
+          reranked = outcome.reranked;
+          rerankWarning = outcome.warning;
+        } finally {
+          if (this.rerankController === controller) this.rerankController = undefined;
+        }
+      }
+      // Only final listed notes (plus a real reference) enter the graph fetch.
+      const members = context.anchor ? [context.anchor, ...results] : results;
       let graphData;
       let graphFailed = false;
       if (members.length) {
@@ -533,7 +561,8 @@ export class SemanticSearchView extends ItemView {
       this.needsRefresh = false;
       this.resultStatusEl.replaceChildren();
       this.resultStatusEl.createEl("strong", { text: `${results.length} notes`, cls: "local-semantic-result-count" });
-      this.resultStatusEl.createEl("strong", { text: mode === "connections" ? context.targetPassageId ? "Passage similarity" : "Note similarity" : "Hybrid search", cls: "local-semantic-result-mode" });
+      this.resultStatusEl.createEl("strong", { text: mode === "connections" ? context.targetPassageId ? "Passage similarity" : "Note similarity" : reranked ? "Hybrid search + JEV reranking" : "Hybrid search", cls: "local-semantic-result-mode" });
+      if (rerankWarning) this.resultStatusEl.createDiv({ text: rerankWarning, cls: "local-semantic-result-warning" });
       if (exhausted) this.resultStatusEl.createDiv({ text: "Candidate limit reached; additional admitted matches may exist.", cls: "local-semantic-result-warning" });
       if (graphData) this.graph.setData(graphData);
       else {
@@ -564,6 +593,7 @@ export class SemanticSearchView extends ItemView {
       title.addEventListener("auxclick", (event) => { if (event.button === 1) void this.openResult(result, context, event); });
       article.createDiv({ text: result.path, cls: "local-semantic-result-path" });
       article.createDiv({ text: result.scoreKind === "similarity" ? `${context.targetPassageId ? "Passage" : "Note"} cosine ${result.score.toFixed(6)}` : `Hybrid rank score ${result.score.toFixed(6)}`, cls: "local-semantic-score" });
+      if (result.rerankScore !== undefined) article.createDiv({ text: `JEV relevance ${result.rerankScore.toFixed(6)}`, cls: "local-semantic-score" });
       const passages = article.createDiv({ cls: "local-semantic-passages" });
       passages.hidden = true;
       const show = async () => {

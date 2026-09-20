@@ -16,6 +16,7 @@ const exec = promisify(execFile);
 export interface ServiceSettings {
   weaviateUrl: string;
   weaviateApiKey: string;
+  openrouterApiKey?: string;
   containerBackend: "podman" | "docker";
   nativeDownloadsApproved: boolean;
   embeddingDevice?: "auto" | "webgpu" | "wasm";
@@ -42,7 +43,9 @@ export class ServiceManager {
     try {
       const raw: unknown = JSON.parse(await readFile(join(this.runtimeDir, "credentials.json"), "utf8"));
       if (!raw || typeof raw !== "object" || !("weaviateApiKey" in raw) || typeof raw.weaviateApiKey !== "string") throw new Error("Invalid local credential file");
+      if ("openrouterApiKey" in raw && typeof raw.openrouterApiKey !== "string") throw new Error("Invalid local credential file");
       this.settings.weaviateApiKey = raw.weaviateApiKey;
+      this.settings.openrouterApiKey = "openrouterApiKey" in raw ? raw.openrouterApiKey as string : "";
     } catch (error) { if (!missingFile(error)) throw error; }
     try {
       const raw: unknown = JSON.parse(await readFile(join(this.runtimeDir, "ownership.json"), "utf8"));
@@ -62,7 +65,8 @@ export class ServiceManager {
       await mkdir(this.runtimeDir, { recursive: true, mode: 0o700 });
       await chmod(this.runtimeDir, 0o700);
       const credentials = join(this.runtimeDir, "credentials.json");
-      await writeFile(`${credentials}.pending`, JSON.stringify({ weaviateApiKey: this.settings.weaviateApiKey }), { mode: 0o600 });
+      await writeFile(`${credentials}.pending`, JSON.stringify({ weaviateApiKey: this.settings.weaviateApiKey, openrouterApiKey: this.settings.openrouterApiKey ?? "" }), { mode: 0o600 });
+      await chmod(`${credentials}.pending`, 0o600);
       await rename(`${credentials}.pending`, credentials);
     });
     this.secretWrites = write.catch(() => undefined);

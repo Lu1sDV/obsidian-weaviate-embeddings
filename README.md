@@ -1,6 +1,6 @@
 # Local Semantic Search
 
-I made this to study chunking, late chunking, and embeddings. It ended up as a desktop Obsidian plugin. Models run locally through Transformers.js; Weaviate stores the vectors and handles retrieval.
+I made this to study chunking, late chunking, and embeddings. It ended up as a desktop Obsidian plugin. Embedding models run locally through Transformers.js; Weaviate stores the vectors and handles retrieval.
 
 Personal experiment. Not a polished product.
 
@@ -9,7 +9,7 @@ Personal experiment. Not a polished product.
 - **Standard chunking:** split Markdown around its structure, then embed each passage separately.
 - **Late chunking:** encode a larger context window first, then pool each passage's token embeddings. Same passage boundaries, different context. Jina only.
 - **Connections:** related notes using cosine similarity, from the whole note or a selected passage.
-- **Search:** Weaviate hybrid retrieval — keyword search plus vectors.
+- **Search:** Weaviate hybrid retrieval — keyword search plus vectors. Optional JEV reranking via OpenRouter is off by default; enabling it sends queries and candidate excerpts to the cloud. See [JEV reranking](docs/jev-reranking.md) for setup, privacy, and the native JSON contract.
 
 Models: Granite 97M R2 (default), MiniLM L6 v2, and Jina Embeddings v2 Small. Standard is the default mode. Jina uses 3,584-token runtime windows here, not its advertised 8,192 positions. Longer notes are split across windows; changing model or chunking mode rebuilds the index. Used Jina for late chunking due to its mean pooling, Granite R2 does CLS chunking and it's not suited to late chunking.
 

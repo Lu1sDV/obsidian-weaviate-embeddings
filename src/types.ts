@@ -117,5 +117,7 @@ export interface SearchResult {
   snapshotId: string;
   score: number;
   scoreKind: "similarity" | "hybrid";
+  /** Independent JEV relevance; the original retrieval score is never overwritten. */
+  rerankScore?: number;
   passages: Array<{ passageId: string; heading: string; body: string; startLine: number; endLine: number }>;
 }
