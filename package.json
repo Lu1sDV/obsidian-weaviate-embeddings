@@ -7,7 +7,7 @@
     "build": "node esbuild.mjs production",
     "dev": "node esbuild.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --tsconfig tests/tsconfig.json --test tests/*.test.ts",
+    "test": "tsx --tsconfig tests/tsconfig.json --test tests/*.test.ts tests/*.test.cjs",
     "package": "npm run build && node scripts/package-worker.mjs"
   },
   "devDependencies": {

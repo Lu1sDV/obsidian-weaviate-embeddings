@@ -16,6 +16,12 @@ The reranker judges each note using its title and up to three matched passage ex
 
 **Connections, its active-note reference, and passage-target navigation are not sent for reranking.** There is no remote embedding or remote Weaviate option in this feature. Empty searches, fewer than two results, and disabled reranking send no requests.
 
+## Current-search reuse and invalidation
+
+Index publications are coalesced for 250 ms and do not interrupt a still-valid running query. One follow-up local retrieval runs after that query completes. Each view keeps at most one successful reranking fingerprint and its numeric scores in memory, never the request text or credentials. Reuse requires the same provider/key, ordered note snapshots, generation, embedding fingerprint, and exact serialized JEV evidence. The current retrieval scores and objects are preserved on a cache hit.
+
+Query/filter/settings changes, note-specific privacy invalidation, switching modes, closing the view, and plugin unload clear this cache. Active candidate membership is tracked even before results are displayed, so invalidating a candidate immediately aborts its pending network request. Admission is still rechecked before any cache hit, request, and publication. Failed requests are not cached as successful rankings.
+
 ## Native JEV JSON contract
 
 JEV is a structured decision model, not a chat-completions model. This integration uses:
@@ -63,6 +69,14 @@ A `noul` answer represents the model's probability of “yes.” Here it is used
 
 Only native `noul` answers are accepted. Missing/extra answer IDs, wrong primitive types, nonnumeric or out-of-range scores, error envelopes, chat responses, and Markdown-wrapped JSON cause a complete fallback. This is not a generic provider, free-form LLM JSON, `response_format`, or `/v1/rerank` implementation. The `/api/alpha/decisions` endpoint is an alpha API; upstream contract changes require an adapter update.
 
+## Context window: tokens are not bytes
+
+As checked on 2026-09-21, OpenRouter lists **32,000 tokens** for JEV 1.13 and the latest alias. See the [model card](https://openrouter.ai/typesafe/jev-1.13/api). The latest alias is mutable; this is not a permanent guarantee for future versions.
+
+The current code enforces **24,000 UTF-8 bytes of the entire serialized request**, including state, every question, JSON escaping and field names. This is a conservative transport/input cap, **not an exact JEV token count or a proven context-window guarantee**. A JEV-matched tokenizer and the provider's internal framing have not yet been validated. Embedding-model token counts cannot be reused for JEV. Context/other HTTP rejection keeps the original hybrid ranking; it does not silently truncate more content and retry.
+
+Both standard and late chunking currently use exactly the same matched-passage evidence policy. The 1,200-byte body prefix can remove relevant material, and late-chunk embeddings can contain context absent from that prefix. Do not increase the byte cap or switch to whole-note uploads on the assumption that 32K tokens are available per note. See [the proposed context-aware evidence strategy](jev-context-strategy.md), which is a design and evaluation plan, not additional implemented upload behavior.
+
 ## Privacy, credentials, and limits
 
 Enabling reranking authorizes sending the query, admitted candidate titles, and bounded passage excerpts to **OpenRouter and the TypeSafe provider**. Requests can incur OpenRouter charges. Search uses the existing input debounce; cancelling a request cannot recall text already sent or guarantee that no charge was incurred.
@@ -102,7 +116,7 @@ Missing credentials, rate limits, exhausted credits, authentication/network/HTTP
 
 ## Verification and references
 
-The new unit tests cover settings defaults, native wire shape, bounded input, metadata omission, ID mapping, stable ties, original-score preservation, all-or-nothing batches, error handling, admission checks, cancellation, deadlines, fixed HTTPS routing, and response limits.
+The unit and mocked view-lifecycle tests cover active-candidate cancellation (including a delayed real loopback connection), coalesced index refreshes, current-search cache invalidation, credential migration/roundtrip/removal, data.json credential redaction, settings defaults, native wire shape, bounded input, metadata omission, ID mapping, stable ties, original-score preservation, all-or-nothing batches, error handling, admission checks, cancellation, deadlines, fixed HTTPS routing, and response limits.
 
 Run the repository's normal checks after applying the change:
 

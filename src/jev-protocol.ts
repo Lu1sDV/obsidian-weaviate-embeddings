@@ -1,6 +1,8 @@
 /** JEV is a decisions model, not a chat-completions or /v1/rerank model. */
 export const JEV_ENDPOINT = "https://openrouter.ai/api/alpha/decisions";
 export const JEV_MODEL = "~typesafe/jev-latest";
+// Full serialized-body byte cap, NOT a JEV token count. See docs/jev-context-strategy.md.
+// Do not raise it using the embedding tokenizer: JEV's tokenizer/framing are not validated here.
 export const MAX_REQUEST_BYTES = 24_000;
 export const MAX_BATCH_SIZE = 8;
 export const MAX_CANDIDATES = 30;

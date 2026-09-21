@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import type { CurrentRerankingCache } from "./reranking-cache";
 import { postJevDecisions, type DecisionTransport } from "./jev-http";
 import { buildJevBatches, parseJevAnswers, RerankingCancelledError, RerankingError, type RerankCandidate, type RerankingErrorCode } from "./jev-protocol";
 import type { RerankingSettings } from "./reranking-config";
@@ -6,6 +8,8 @@ export interface RerankingOptions {
   signal: AbortSignal;
   /** Recheck admission/current snapshots before every outbound batch and before publication. */
   isCurrent: () => boolean;
+  /** Per-view cache; snapshotKey includes generation, embedding identity and ordered note snapshots. */
+  cache?: { store: CurrentRerankingCache; snapshotKey: string };
 }
 export interface RerankingOutcome<T> {
   results: Array<T & { rerankScore?: number }>;
@@ -50,7 +54,10 @@ export class JevReranker {
     };
     assertCurrent();
     const config = this.configuration();
-    if (!config.enabled || !query.trim() || candidates.length < 2) return original;
+    if (!config.enabled || !query.trim() || candidates.length < 2) {
+      options.cache?.store.clear();
+      return original;
+    }
     if (config.provider !== "jev-openrouter" || !config.apiKey.trim()) return { ...original, warning: WARNINGS.configuration };
     const controller = new AbortController();
     const cancel = () => controller.abort();
@@ -59,6 +66,15 @@ export class JevReranker {
     const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, this.timeoutMs);
     try {
       const batches = buildJevBatches(query, candidates);
+      // Hash the actual wire input AND identities/settings, not just the query.
+      const cacheKey = options.cache ? createHash("sha256").update(JSON.stringify([
+        config.provider, config.apiKey, options.cache.snapshotKey, batches,
+      ])).digest("hex") : undefined;
+      const cached = cacheKey ? options.cache?.store.read(cacheKey) : undefined;
+      if (cached) {
+        assertCurrent();
+        return { results: rankCandidates(candidates, cached), reranked: true };
+      }
       const scores = new Map<string, number>();
       for (const batch of batches) {
         assertCurrent();
@@ -68,14 +84,15 @@ export class JevReranker {
         for (const [id, score] of parseJevAnswers(response, Object.keys(batch.questions))) scores.set(id, score);
       }
       assertCurrent();
-      // Commit only after every batch validates; never mix hybrid and JEV score scales.
-      const ranked = candidates.map((result, index) => {
-        const rerankScore = scores.get(`candidate_${index}`);
-        if (rerankScore === undefined) throw new RerankingError("response");
-        return { result: { ...result, rerankScore }, index };
+      // Commit only after every batch validates; never mix hybrid and JEV scales.
+      const values = candidates.map((_, index) => {
+        const score = scores.get(`candidate_${index}`);
+        if (score === undefined) throw new RerankingError("response");
+        return score;
       });
-      ranked.sort((left, right) => right.result.rerankScore - left.result.rerankScore || left.index - right.index);
-      return { results: ranked.map(item => item.result), reranked: true };
+      const results = rankCandidates(candidates, values);
+      if (cacheKey) options.cache?.store.write(cacheKey, values);
+      return { results, reranked: true };
     } catch (error) {
       assertCurrent();
       const code = timedOut ? "timeout" : error instanceof RerankingError ? error.code : "network";
@@ -86,4 +103,14 @@ export class JevReranker {
       controller.abort();
     }
   }
+}
+
+function rankCandidates<T>(candidates: readonly T[], scores: readonly number[]): Array<T & { rerankScore: number }> {
+  if (scores.length !== candidates.length) throw new RerankingError("response");
+  return candidates.map((result, index) => {
+    const rerankScore = scores[index];
+    if (rerankScore === undefined || !Number.isFinite(rerankScore) || rerankScore < 0 || rerankScore > 1) throw new RerankingError("response");
+    return { result: { ...result, rerankScore }, index };
+  }).sort((left, right) => right.result.rerankScore - left.result.rerankScore || left.index - right.index)
+    .map(item => item.result);
 }
