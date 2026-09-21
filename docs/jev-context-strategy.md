@@ -1,58 +1,50 @@
-# Context-aware JEV evidence: proposed strategy and evaluation
+# Context-aware JEV evidence: implementation and evaluation
 
-Status: **design proposal, not implemented evidence expansion**. The PR still sends only bounded matched-passage excerpts. Its lifecycle fixes do not widen the cloud-upload scope. Context information below was checked on 2026-09-21.
+## Implemented in this PR
 
-## Separate the three decisions
+JEV continues to rank notes. The evidence selector now preserves complete retrieved passages, prioritizes up to three strongest distinct matches, and optionally adds bounded context from the exact indexed snapshot. Standard mode tries immediate same-heading neighbours; Late first tries a fitting contiguous same-heading section, then nearby source passages. Whole-short-note selection is separately optional and off by default. Overlaps are deduplicated, gaps and evidence roles are explicit, and stronger matches take budget priority.
 
-1. **Index boundaries** determine which raw text spans are passages (paragraphs, sections, or bounded splits).
-2. **Embedding strategy** determines whether each passage is encoded independently (standard) or its token representations are pooled after processing a larger window (late).
-3. **Reranking evidence** determines which actual text JEV sees for a retrieved candidate. JEV receives no vectors and cannot recover their contextual information.
+Source use is checked against the ordered manifest passage IDs and canonical-body SHA-256. The source is local Weaviate data, never unverified live Markdown. Cancellation, source errors, evidence overflow and API failure retain the existing privacy/fallback behavior. Old prefix-only settings require renewed enablement after migration.
 
-Paragraph boundaries and late chunking are not opposites. The same paragraph spans can use either embedding strategy. This plugin's Jina late mode uses 3,584-token embedding windows, not arbitrary full-note context. Those token counts use the embedding tokenizer, not JEV's.
+See [setup and precise limits](jev-reranking.md). These are implemented heuristics, **not benchmark-selected optimal settings**.
 
-## Current behavior
+## Boundaries, embeddings, and evidence are separate
 
-Weaviate retrieves passages and groups them into notes by their best hybrid score. The UI keeps at most 30 admitted notes. For each note JEV receives its title and the **three highest-ranked matched passages**, not the first three paragraphs of the note. Bodies are prefix-truncated to 1,200 UTF-8 bytes; headings to 128 and titles to 256. It returns one relevance value for the note's combined evidence. Passages are not themselves reranked, no full note is read for JEV, and both embedding modes use this identical policy.
+Paragraph/section boundaries decide what text a passage contains. Standard versus Late decides how its embedding is computed. Evidence policy decides what actual text the reranker receives. Paragraph chunking and Late chunking are not opposites: the same source spans can use either embedding strategy.
 
-This is a useful baseline but can discard the text that made a hit relevant. In late mode, a passage such as "It was introduced in 2024" can have a relevant contextual embedding because an earlier paragraph names the subject, yet be ambiguous to a text-only reranker.
+The existing chunker packs adjacent structural units within a section, so a stored passage can contain several paragraphs. Jina Late uses this plugin's 3,584-token embedding windows. Those are local-model tokens, not JEV tokens. Late enriches the vectors with surrounding information without rewriting the stored text. A passage beginning with an unresolved pronoun can therefore retrieve well yet confuse a text-only reranker unless relevant surrounding source is supplied.
 
-## Recommended next evidence policy
+The current bounded-context implementation addresses some of that evidence loss. It cannot restore information farther away than its selected windows, and does not recreate the exact original embedding context. It is preferable to claiming that a vector's context is automatically available to JEV.
 
-Keep **note-level ranking** to match the UI, but construct a bounded evidence pack anchored on retrieved passages. First preserve complete matched spans where they fit; avoid always taking an arbitrary prefix. Include title and heading ancestry. Deduplicate overlapping spans and preserve source order inside each context window. Bound the number of anchors and total evidence per note so long notes do not receive unlimited scoring opportunities.
+## Deliberately not claimed as complete
 
-For **standard/paragraph embeddings**, start with matched paragraphs plus their heading. Add a small adjacent window when needed for definitions, pronouns, lists, or section context. Even independently embedded paragraphs can be semantically incomplete.
+**Exact JEV token budgeting:** The earlier OpenRouter card listed 32,000 tokens for JEV 1.13/latest. A JEV-matched tokenizer, native framing rules or supported preflight counter has not been validated. The implemented 24,000-byte serialized-JSON cap remains a conservative input limit, not an exact token count or proof of fit. Outcome diagnostics accept actual post-call usage; they do not infer tokens from bytes. Provider rejection safely falls back without truncating and retrying.
 
-For **late embeddings**, add actual surrounding text more deliberately. Prefer the matched passage with a clearly distinguished enclosing section or original embedding window when it fits. A previous/next-paragraph window is a bounded fallback, not a reconstruction of all context encoded by late chunking. Dependencies may be farther away or on either side. Exact embedding-window recovery requires persisting verified segment boundaries with the indexed snapshot; do not guess them from line numbers or rerun a possibly changed chunker.
+Before expanding requests further, establish official token accounting, version it against the resolved model, and budget the whole request: state, every candidate, query, questions and framing. Reserve margin rather than targeting full context. A tentative 24,000-**counted-token** target would require that validation; it is not the implemented 24,000-**byte** policy. Do not use Jina/MiniLM/Granite counts or an English characters/4 estimate.
 
-For **short notes**, the complete canonical body may be a useful optional strategy if it fits that note's evidence budget. For long notes, use bounded anchored windows rather than uploading every note. Never include frontmatter, excluded content, or source from a different snapshot. Load expanded text only after admission, verify its identity before sending, and track it for immediate invalidation. Expanded uploads require an updated user-facing disclosure.
+**Exact Late embedding windows:** Persist verified segment boundaries with the index and its source snapshot before offering original-window evidence. Do not guess from line numbers or rerun a potentially different chunker. This PR deliberately avoids an index-schema migration just for heuristic context selection.
 
-Retaining one note-level Noul question over that pack lets complementary passages jointly establish relevance. As an ablation, evaluate independent passage/window questions with a fixed maximum number per note and aggregate using the maximum for targeted lookups. Max aggregation can favor notes with more opportunities; means can penalize a single strong match surrounded by irrelevant text. Neither is an established universal best choice, especially for synthesis queries.
+**Query-anchored subwindows for an oversized strongest passage:** The current safe behavior is a complete-query hybrid fallback. A future subwindow strategy needs explicit anchoring/evaluation rather than reinstating arbitrary prefix cuts. Lower-ranked matches can be omitted with visible counts; the strongest match is never silently discarded.
 
-## Budget the whole request, not each note independently
+**A universal best ranking strategy:** No measured relevance improvement is claimed. One Noul question currently judges the note's combined evidence. Independent passage/window scoring with max aggregation is a useful ablation for precise lookups, but gives notes with more scoring opportunities an advantage. Means can dilute a strong match, and synthesis queries may require evidence from several passages jointly. Compare before choosing another default.
 
-OpenRouter currently advertises **32,000 context tokens** for JEV 1.13/latest. This is not 32,000 per candidate. Budget the query, titles/headings, all candidate text, questions, serialization/framing, and reserved overhead together. JEV's native Noul output is not a generated answer paragraph; do not invent a chat `max_tokens` control for this endpoint.
+## Evaluation plan
 
-Before expanding evidence:
+Use two experiments:
 
-- Validate the actual JEV tokenizer or an official token-count service, and how native JSON/framing consumes context. Do not use Jina/MiniLM/Granite token counts or an English characters/4 rule.
-- Establish a soft input target below the advertised limit (for example, 24,000 **counted tokens**, with the remaining capacity reserved), then dynamically pack candidates. This is a proposed token target, not the current 24,000-**byte** implementation cap.
-- Allocate a bounded per-note evidence budget. When a batch would overflow, start a new request. When a note's evidence alone would overflow, shrink optional surrounding context first, then use explicit anchored subwindows or skip reranking with a visible fallback. Never silently drop a shortlisted note.
-- Revalidate limits when changing the resolved model. The `~typesafe/jev-latest` alias can move; pin/record the model version for controlled experiments. Record token usage, batch count, truncation/expansion policy and timing without logging note text or keys.
+1. Hold retrieved candidates fixed to isolate reranking evidence policy.
+2. Run complete retrieval plus reranking to measure the actual Standard/Late combination.
 
-The existing byte guard counts the entire escaped JSON body, which is better than counting text characters alone, but does not prove fit under an unverified tokenizer/internal framing. Keep it conservative in the meantime and retain all-or-nothing fallback for provider rejection. Full capacity is not a target: extra unrelated text adds cost and may hurt relevance.
+Compare original hybrid order; the prior prefix baseline; complete matched passages; bounded-context evidence; and optional whole-short-note evidence. Evaluate original-window evidence only after verified boundaries exist. Keep per-note and total request budgets comparable and use held-out queries with note-level relevance labels.
 
-## Evaluation before choosing a default
+Include targeted lookup, multi-passage synthesis, pronoun/definition dependencies, long notes, window seams and multilingual text. Measure nDCG@10, MRR, candidate recall/coverage, latency percentiles, request/token cost, omitted-evidence frequency and timeout/fallback rate. Count fallback results too instead of reporting only successful reranks. Record model/version and policy settings; do not log real note text or credentials by default.
 
-Use two complementary experiments. Hold retrieval candidates fixed to isolate the reranking evidence policy, then run end-to-end retrieval plus reranking to measure the actual standard-versus-late effect. Avoid attributing improved candidate recall to the reranker.
+Additional context is not automatically useful: complete matches avoid arbitrary evidence loss, but irrelevant surrounding text can dilute a decision and increase cost. The initial Standard/Late radii and byte budgets are tunable hypotheses, not recommendations supported by benchmark results.
 
-Compare: original hybrid order; current truncated matches; complete matched paragraphs; matched paragraphs plus bounded surrounding context; and whole short-note/original-window evidence where feasible. Use the same held-out queries, note-level relevance labels and per-note/request budgets. Evaluate targeted, multi-passage synthesis, pronoun/definition-dependent, long-note, window-seam and multilingual cases. Report nDCG@10, MRR, recall/coverage of the reranked shortlist, latency percentiles, request/token cost, truncation rate, and timeout/fallback rate.
+## References
 
-No measured quality improvement or best default is claimed by this proposal. The first practical change to evaluate is preserving complete matched passages and restoring bounded source context for late-chunk hits, rather than simply raising the upload limit.
-
-## Primary references
-
-- [OpenRouter JEV 1.13 model card](https://openrouter.ai/typesafe/jev-1.13/api): 32,000-token context as checked on 2026-09-21.
-- [OpenRouter TypeSafe family](https://openrouter.ai/typesafe): latest alias and context listing.
-- [TypeSafe quickstart](https://docs.typesafe.ai/introduction/quickstart): native state/questions and typed decisions.
-- [Jina: Late Chunking in Long-Context Embedding Models](https://jina.ai/news/late-chunking-in-long-context-embedding-models/): chunk boundaries versus context-conditioned representations.
-- [Repository README](../README.md): actual plugin window size and implemented embedding modes.
+- [TypeSafe quickstart](https://docs.typesafe.ai/introduction/quickstart): state/questions and native decisions.
+- [Official TypeSafe SDK types](https://github.com/typesafe-ai/typesafe-sdk-js/blob/66880ccded6cb642dc1809620c2b108c33730214/src/types.ts): post-request token usage and current request shape.
+- [OpenRouter JEV 1.13 model card](https://openrouter.ai/typesafe/jev-1.13/api): source of the earlier context-limit observation; latest alias is mutable.
+- [Jina Late Chunking](https://jina.ai/news/late-chunking-in-long-context-embedding-models/): contextual token representations versus pooling boundaries.
+- [Repository README](../README.md): actual local embedding modes and runtime window size.

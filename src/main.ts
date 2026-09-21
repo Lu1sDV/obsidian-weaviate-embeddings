@@ -11,6 +11,8 @@ import { SemanticSearchView, VIEW_TYPE } from "./search-view";
 import { ServiceManager, type ServiceSettings } from "./services";
 import { mergeState } from "./state";
 import { JevReranker } from "./reranking";
+import { createStoredEvidenceLoader } from "./reranking-source";
+import { addRerankingEvidenceSettings } from "./reranking-settings";
 import { mergeRerankingSettings, RERANKING_PROVIDERS, type RerankingSettings } from "./reranking-config";
 import type { ExclusionSettings, PersistedState } from "./types";
 
@@ -68,9 +70,13 @@ export default class LocalSemanticSearchPlugin extends Plugin {
     await this.persist();
     this.services = new ServiceManager(this.serviceSettings, this.state.vaultId, this.pluginDir, message => this.setStatus(message), getModelProfile(this.state.embeddingModel, this.state.chunkingMode));
     await this.services.loadSecrets();
-    this.reranker = new JevReranker(() => ({ ...this.rerankingSettings, apiKey: this.serviceSettings.openrouterApiKey ?? "" }));
     this.pathPolicy = new PathPolicy(this.app, this.state);
     const clients = this.services.clients();
+    this.reranker = new JevReranker(
+      () => ({ ...this.rerankingSettings, apiKey: this.serviceSettings.openrouterApiKey ?? "", chunkingMode: this.state.chunkingMode }),
+      undefined, undefined,
+      createStoredEvidenceLoader(this.state, clients.weaviate, () => clients.embeddings.profile.modelFingerprint),
+    );
     this.indexer = new IndexCoordinator(this.app, this.state, this.registry, clients.embeddings, clients.weaviate, () => this.persist(), message => this.setStatus(message), this.pathPolicy, () => {
       this.views().forEach(view => view.indexChanged());
     });
@@ -486,7 +492,7 @@ class LocalSemanticSettings extends PluginSettingTab {
     new Setting(root).setName("Stop owned services").setDesc("Stops indexing first and waits for outstanding work. Borrowed services survive.").addButton(button => button.setButtonText("Stop owned services").setWarning().onClick(() => this.plugin.run(() => this.plugin.stopOwnedServices())));
     root.createEl("p", { text: `Status: ${this.plugin.getStatus()}`, cls: "setting-item-description" });
     root.createEl("h2", { text: "Search reranking" });
-    root.createEl("p", { text: "Optional cloud processing. When enabled, Search queries, candidate note titles, and bounded matched-passage excerpts are sent to OpenRouter and TypeSafe. Connections and embedding/indexing remain local. Requests may incur OpenRouter charges. Content already sent cannot be recalled by disabling this option.", cls: "setting-item-description" });
+    root.createEl("p", { text: "Optional cloud processing. When enabled, Search queries, candidate note titles, complete matched passages and optional bounded source context or whole short notes are sent to OpenRouter and TypeSafe. Connections and embedding/indexing remain local. Requests may incur OpenRouter charges. Content already sent cannot be recalled by disabling this option.", cls: "setting-item-description" });
     new Setting(root).setName("Reranking provider").setDesc("Only JEV and its native Decisions JSON format are supported.").addDropdown(dropdown => {
       dropdown.selectEl.setAttribute("aria-label", "Reranking provider");
       for (const provider of RERANKING_PROVIDERS) dropdown.addOption(provider.id, provider.label);
@@ -495,6 +501,7 @@ class LocalSemanticSettings extends PluginSettingTab {
         if (provider) this.plugin.run(() => this.plugin.setRerankingSettings({ ...this.plugin.rerankingSettings, provider: provider.id }));
       });
     });
+    addRerankingEvidenceSettings(root, this.plugin);
     new Setting(root).setName("Enable search reranking").setDesc("Off by default. Enabling permits the cloud processing described above. API failures preserve the original hybrid ranking.").addToggle(toggle => {
       toggle.setValue(this.plugin.rerankingSettings.enabled).onChange(enabled => this.plugin.run(async () => {
         try { await this.plugin.setRerankingSettings({ ...this.plugin.rerankingSettings, enabled }); }

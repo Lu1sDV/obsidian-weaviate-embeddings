@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildJevBatches, JEV_MODEL, MAX_BATCH_SIZE, MAX_CANDIDATES, MAX_PASSAGE_BYTES, MAX_QUERY_BYTES, MAX_REQUEST_BYTES, parseJevAnswers, RerankingCancelledError, RerankingError, truncateUtf8, type JevRequest } from "../src/jev-protocol";
+import { buildJevBatches, JEV_MODEL, MAX_BATCH_SIZE, MAX_CANDIDATES, MAX_QUERY_BYTES, MAX_REQUEST_BYTES, parseJevAnswers, RerankingCancelledError, RerankingError, truncateUtf8, type JevRequest } from "../src/jev-protocol";
 import { JevReranker } from "../src/reranking";
 import { DEFAULT_RERANKING_SETTINGS, mergeRerankingSettings, RERANKING_PROVIDERS } from "../src/reranking-config";
 import type { DecisionTransport } from "../src/jev-http";
@@ -25,7 +25,8 @@ test("settings are opt-in and offer only JEV native JSON", () => {
   for (const value of [null, undefined, 1, [], {}, { enabled: true }, { enabled: true, provider: "chat" }]) {
     assert.deepEqual(mergeRerankingSettings(value), DEFAULT_RERANKING_SETTINGS);
   }
-  assert.deepEqual(mergeRerankingSettings(config), { enabled: true, provider: "jev-openrouter" });
+  assert.deepEqual(mergeRerankingSettings(config), DEFAULT_RERANKING_SETTINGS);
+  assert.deepEqual(mergeRerankingSettings({ ...DEFAULT_RERANKING_SETTINGS, ...config }), { ...DEFAULT_RERANKING_SETTINGS, enabled: true });
   assert.equal(mergeRerankingSettings({ enabled: "true", provider: "jev-openrouter" }).enabled, false);
 });
 
@@ -43,10 +44,10 @@ test("native JEV request contains state/questions, not chat or arbitrary JSON-sc
   for (const forbidden of ["Private/", "noteId", "snapshotId", "passageId", "startLine", "response_format", "messages"]) assert.ok(!json.includes(forbidden));
 });
 
-test("batches and passage excerpts are bounded, including multibyte text and JSON escaping", () => {
+test("batches preserve complete Unicode passages while bounding escaped JSON", () => {
   const input = Array.from({ length: MAX_CANDIDATES }, (_, i) => ({
     ...candidate(i), title: "🧪".repeat(1000),
-    passages: Array.from({ length: 6 }, () => ({ heading: "\u0000".repeat(600), body: "\u0000😀漢字".repeat(5000) })),
+    passages: Array.from({ length: 3 }, (_, j) => ({ heading: `Heading ${j}`, body: `${j}:` + "\u0000😀漢字".repeat(150) })),
   }));
   const batches = buildJevBatches("search", input);
   assert.ok(batches.length > 1);
@@ -54,9 +55,10 @@ test("batches and passage excerpts are bounded, including multibyte text and JSO
   for (const body of batches) {
     assert.ok(Buffer.byteLength(JSON.stringify(body)) <= MAX_REQUEST_BYTES);
     assert.ok(Object.keys(body.questions).length <= MAX_BATCH_SIZE);
-    for (const document of Object.values(body.state.candidates)) {
+    for (const [id, document] of Object.entries(body.state.candidates)) {
+      const original = input[Number(id.split("_")[1])]!;
       assert.equal(document.passages.length, 3);
-      for (const passage of document.passages) assert.ok(Buffer.byteLength(passage.text) <= MAX_PASSAGE_BYTES);
+      assert.deepEqual(document.passages.map(p => p.text), original.passages.map(p => p.body));
     }
   }
   assert.equal(truncateUtf8("A😀B", 4), "A");
