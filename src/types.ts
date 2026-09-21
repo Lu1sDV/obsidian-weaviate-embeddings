@@ -110,6 +110,16 @@ export interface PersistedState {
   presets: Record<string, PropertyFilter[]>;
 }
 
+export interface RerankMetadata {
+  provider: "openrouter" | "typesafe";
+  requestedModel: string;
+  resolvedModel: string;
+  metricVersion: string;
+  relevance: number;
+  winningPassageId: string;
+  evidenceCount: number;
+}
+
 export interface SearchResult {
   noteId: string;
   path: string;
@@ -117,5 +127,7 @@ export interface SearchResult {
   snapshotId: string;
   score: number;
   scoreKind: "similarity" | "hybrid";
-  passages: Array<{ passageId: string; heading: string; body: string; startLine: number; endLine: number }>;
+  rerank?: RerankMetadata;
+  passages: Array<{ passageId: string; heading: string; body: string; startLine: number; endLine: number;
+    retrievalScore?: number; retrievalRank?: number; rerankRelevance?: number }>;
 }

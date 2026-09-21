@@ -10,6 +10,9 @@ import { PropertyRegistry } from "./properties";
 import { SemanticSearchView, VIEW_TYPE } from "./search-view";
 import { ServiceManager, type ServiceSettings } from "./services";
 import { mergeState } from "./state";
+import { RerankService } from "./rerank/service";
+import { RerankStore } from "./rerank/store";
+import { renderRerankSettings } from "./rerank/settings";
 import type { ExclusionSettings, PersistedState } from "./types";
 
 interface PluginData {
@@ -34,6 +37,8 @@ export default class LocalSemanticSearchPlugin extends Plugin {
   services!: ServiceManager;
   pathPolicy!: PathPolicy;
   indexer!: IndexCoordinator;
+  rerankStore!: RerankStore;
+  reranker!: RerankService;
   graphEdgeCutoff = 0.7;
   private sidebarWidthInitialized = false;
   private status = "Indexing is stopped";
@@ -62,13 +67,20 @@ export default class LocalSemanticSearchPlugin extends Plugin {
     this.services = new ServiceManager(this.serviceSettings, this.state.vaultId, this.pluginDir, message => this.setStatus(message), getModelProfile(this.state.embeddingModel, this.state.chunkingMode));
     await this.services.loadSecrets();
     this.pathPolicy = new PathPolicy(this.app, this.state);
+    this.rerankStore = new RerankStore(this.state.vaultId, () => {
+      this.reranker?.invalidate();
+      this.views().forEach(view => view.rerankSettingsChanged());
+    });
+    try { await this.rerankStore.load(); }
+    catch { new Notice("Device-local JEV settings could not be loaded; reranking remains disabled", 8000); }
+    this.reranker = new RerankService(() => this.rerankStore.access());
     const clients = this.services.clients();
     this.indexer = new IndexCoordinator(this.app, this.state, this.registry, clients.embeddings, clients.weaviate, () => this.persist(), message => this.setStatus(message), this.pathPolicy, () => {
       this.views().forEach(view => view.indexChanged());
     });
     const settings = new LocalSemanticSettings(this.app, this);
     this.addSettingTab(settings);
-    this.registerView(VIEW_TYPE, leaf => new SemanticSearchView(leaf, this.state, this.registry, clients.embeddings, clients.weaviate, () => this.persist(), this.pathPolicy, this.graphEdgeCutoff));
+    this.registerView(VIEW_TYPE, leaf => new SemanticSearchView(leaf, this.state, this.registry, clients.embeddings, clients.weaviate, () => this.persist(), this.pathPolicy, this.graphEdgeCutoff, this.reranker, this.rerankStore));
     this.addRibbonIcon("network", "Open semantic neighbourhood", () => this.run(() => this.activateView()));
     this.addCommand({ id: "open-local-semantic-search", name: "Open semantic neighbourhood", callback: () => this.run(() => this.activateView()) });
     this.addCommand({ id: "stop-owned-local-semantic-services", name: "Stop owned services", callback: () => this.run(() => this.stopOwnedServices()) });
@@ -99,6 +111,8 @@ export default class LocalSemanticSearchPlugin extends Plugin {
 
   onunload(): void {
     this.disposed = true;
+    this.reranker?.dispose();
+    this.views().forEach(view => view.rerankSettingsChanged());
     this.indexer.stop();
     this.pathPolicy.invalidate();
     this.services.disconnect();
@@ -339,6 +353,7 @@ export default class LocalSemanticSearchPlugin extends Plugin {
   }
 
   private invalidateViews(noteId?: string): void {
+    this.reranker?.invalidate();
     this.views().forEach(view => view.invalidate(noteId));
   }
 
@@ -464,6 +479,7 @@ class LocalSemanticSettings extends PluginSettingTab {
     });
     new Setting(root).setName("Stop owned services").setDesc("Stops indexing first and waits for outstanding work. Borrowed services survive.").addButton(button => button.setButtonText("Stop owned services").setWarning().onClick(() => this.plugin.run(() => this.plugin.stopOwnedServices())));
     root.createEl("p", { text: `Status: ${this.plugin.getStatus()}`, cls: "setting-item-description" });
+    renderRerankSettings(root, this.plugin.rerankStore, this.plugin.reranker, operation => this.plugin.run(operation), () => this.display());
     root.createEl("h2", { text: "Similarity graph" });
     new Setting(root).setName("Edge cutoff").setDesc("Minimum cosine similarity for a visible Search-mode edge. Connections always shows one labelled edge from the current note to each result. Rankings never change.").addDropdown(dropdown => {
       dropdown.addOption("-1", "Show all edges");
