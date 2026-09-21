@@ -103,7 +103,7 @@ export class JevReranker {
       const warning = omitted ? `JEV used complete passages; ${omitted} lower-ranked matched passage(s) were omitted by the per-note evidence limits.` : undefined;
       if (cached) {
         current(); diagnostics.cacheHit = true;
-        return { results: rankCandidates(candidates, cached), reranked: true, warning, diagnostics };
+        return { results: rankCandidates(candidates, cached), reranked: true, ...(warning ? { warning } : {}), diagnostics };
       }
       const scores = new Map<string, number>();
       for (const batch of batches) {
@@ -124,7 +124,7 @@ export class JevReranker {
       });
       const results = rankCandidates(candidates, values);
       if (cacheKey) options.cache?.store.write(cacheKey, values);
-      return { results, reranked: true, warning, diagnostics };
+      return { results, reranked: true, ...(warning ? { warning } : {}), diagnostics };
     } catch (error) {
       assertCurrent();
       options.cache?.store.clear();
