@@ -10,11 +10,16 @@ import { PropertyRegistry } from "./properties";
 import { SemanticSearchView, VIEW_TYPE } from "./search-view";
 import { ServiceManager, type ServiceSettings } from "./services";
 import { mergeState } from "./state";
+import { JevReranker } from "./reranking";
+import { createStoredEvidenceLoader } from "./reranking-source";
+import { addRerankingEvidenceSettings } from "./reranking-settings";
+import { mergeRerankingSettings, RERANKING_PROVIDERS, type RerankingSettings } from "./reranking-config";
 import type { ExclusionSettings, PersistedState } from "./types";
 
 interface PluginData {
   state: PersistedState;
   services: ServiceSettings;
+  reranking: RerankingSettings;
   graphEdgeCutoff: number;
   sidebarWidthInitialized: boolean;
 }
@@ -22,6 +27,7 @@ interface PluginData {
 const defaultServices: ServiceSettings = {
   weaviateUrl: "http://127.0.0.1:8080",
   weaviateApiKey: "",
+  openrouterApiKey: "",
   containerBackend: "podman",
   nativeDownloadsApproved: false,
   embeddingDevice: "auto",
@@ -30,6 +36,8 @@ const defaultServices: ServiceSettings = {
 export default class LocalSemanticSearchPlugin extends Plugin {
   state!: PersistedState;
   serviceSettings!: ServiceSettings;
+  rerankingSettings!: RerankingSettings;
+  reranker!: JevReranker;
   registry!: PropertyRegistry;
   services!: ServiceManager;
   pathPolicy!: PathPolicy;
@@ -52,7 +60,8 @@ export default class LocalSemanticSearchPlugin extends Plugin {
     this.state = mergeState(data?.state);
     if (typeof data?.graphEdgeCutoff === "number" && Number.isFinite(data.graphEdgeCutoff) && data.graphEdgeCutoff >= -1 && data.graphEdgeCutoff <= 1) this.graphEdgeCutoff = data.graphEdgeCutoff;
     this.sidebarWidthInitialized = data?.sidebarWidthInitialized === true;
-    this.serviceSettings = { ...defaultServices, ...data?.services, weaviateApiKey: "" };
+    this.rerankingSettings = mergeRerankingSettings(data?.reranking);
+    this.serviceSettings = { ...defaultServices, ...data?.services, weaviateApiKey: "", openrouterApiKey: "" };
     if (this.serviceSettings.embeddingDevice !== "auto" && this.serviceSettings.embeddingDevice !== "webgpu" && this.serviceSettings.embeddingDevice !== "wasm") throw new Error("Unsupported embedding device; select auto, webgpu, or wasm");
     this.registry = new PropertyRegistry(this.state.registry);
     if (!this.manifest.dir || !(this.app.vault.adapter instanceof FileSystemAdapter)) throw new Error("This plugin requires a desktop vault");
@@ -63,12 +72,17 @@ export default class LocalSemanticSearchPlugin extends Plugin {
     await this.services.loadSecrets();
     this.pathPolicy = new PathPolicy(this.app, this.state);
     const clients = this.services.clients();
+    this.reranker = new JevReranker(
+      () => ({ ...this.rerankingSettings, apiKey: this.serviceSettings.openrouterApiKey ?? "", chunkingMode: this.state.chunkingMode }),
+      undefined, undefined,
+      createStoredEvidenceLoader(this.state, clients.weaviate, () => clients.embeddings.profile.modelFingerprint),
+    );
     this.indexer = new IndexCoordinator(this.app, this.state, this.registry, clients.embeddings, clients.weaviate, () => this.persist(), message => this.setStatus(message), this.pathPolicy, () => {
       this.views().forEach(view => view.indexChanged());
     });
     const settings = new LocalSemanticSettings(this.app, this);
     this.addSettingTab(settings);
-    this.registerView(VIEW_TYPE, leaf => new SemanticSearchView(leaf, this.state, this.registry, clients.embeddings, clients.weaviate, () => this.persist(), this.pathPolicy, this.graphEdgeCutoff));
+    this.registerView(VIEW_TYPE, leaf => new SemanticSearchView(leaf, this.state, this.registry, clients.embeddings, clients.weaviate, () => this.persist(), this.pathPolicy, this.graphEdgeCutoff, this.reranker));
     this.addRibbonIcon("network", "Open semantic neighbourhood", () => this.run(() => this.activateView()));
     this.addCommand({ id: "open-local-semantic-search", name: "Open semantic neighbourhood", callback: () => this.run(() => this.activateView()) });
     this.addCommand({ id: "stop-owned-local-semantic-services", name: "Stop owned services", callback: () => this.run(() => this.stopOwnedServices()) });
@@ -99,6 +113,7 @@ export default class LocalSemanticSearchPlugin extends Plugin {
 
   onunload(): void {
     this.disposed = true;
+    this.views().forEach(view => view.invalidate());
     this.indexer.stop();
     this.pathPolicy.invalidate();
     this.services.disconnect();
@@ -119,8 +134,8 @@ export default class LocalSemanticSearchPlugin extends Plugin {
         while (this.saveRequested) {
           this.saveRequested = false;
           this.state.registry = this.registry.data();
-          const services = { ...this.serviceSettings, weaviateApiKey: "" };
-          const payload = JSON.stringify({ state: this.state, services, graphEdgeCutoff: this.graphEdgeCutoff, sidebarWidthInitialized: this.sidebarWidthInitialized });
+          const services = { ...this.serviceSettings, weaviateApiKey: "", openrouterApiKey: "" };
+          const payload = JSON.stringify({ state: this.state, services, reranking: this.rerankingSettings, graphEdgeCutoff: this.graphEdgeCutoff, sidebarWidthInitialized: this.sidebarWidthInitialized });
           const target = join(this.pluginDir, "data.json");
           const temporary = `${target}.pending`;
           const file = await open(temporary, "w", 0o600);
@@ -347,6 +362,18 @@ export default class LocalSemanticSearchPlugin extends Plugin {
     this.views().forEach(view => view.setStatus(message));
   }
 
+  async setRerankingSettings(settings: RerankingSettings): Promise<void> {
+    this.rerankingSettings = mergeRerankingSettings(settings);
+    this.views().forEach(view => view.rerankingChanged());
+    await this.persist();
+  }
+
+  async setOpenRouterApiKey(value: string): Promise<void> {
+    this.serviceSettings.openrouterApiKey = value.trim();
+    this.views().forEach(view => view.rerankingChanged());
+    await this.services.saveSecrets();
+  }
+
   getStatus(): string { return this.status; }
 
   async checkWeaviate(): Promise<void> {
@@ -464,6 +491,37 @@ class LocalSemanticSettings extends PluginSettingTab {
     });
     new Setting(root).setName("Stop owned services").setDesc("Stops indexing first and waits for outstanding work. Borrowed services survive.").addButton(button => button.setButtonText("Stop owned services").setWarning().onClick(() => this.plugin.run(() => this.plugin.stopOwnedServices())));
     root.createEl("p", { text: `Status: ${this.plugin.getStatus()}`, cls: "setting-item-description" });
+    root.createEl("h2", { text: "Search reranking" });
+    root.createEl("p", { text: "Optional cloud processing. When enabled, Search queries, candidate note titles, complete matched passages and optional bounded source context or whole short notes are sent to OpenRouter and TypeSafe. Connections and embedding/indexing remain local. Requests may incur OpenRouter charges. Content already sent cannot be recalled by disabling this option.", cls: "setting-item-description" });
+    new Setting(root).setName("Reranking provider").setDesc("Only JEV and its native Decisions JSON format are supported.").addDropdown(dropdown => {
+      dropdown.selectEl.setAttribute("aria-label", "Reranking provider");
+      for (const provider of RERANKING_PROVIDERS) dropdown.addOption(provider.id, provider.label);
+      dropdown.setValue(this.plugin.rerankingSettings.provider).onChange(value => {
+        const provider = RERANKING_PROVIDERS.find(item => item.id === value);
+        if (provider) this.plugin.run(() => this.plugin.setRerankingSettings({ ...this.plugin.rerankingSettings, provider: provider.id }));
+      });
+    });
+    addRerankingEvidenceSettings(root, this.plugin);
+    new Setting(root).setName("Enable search reranking").setDesc("Off by default. Enabling permits the cloud processing described above. API failures preserve the original hybrid ranking.").addToggle(toggle => {
+      toggle.setValue(this.plugin.rerankingSettings.enabled).onChange(enabled => this.plugin.run(async () => {
+        try { await this.plugin.setRerankingSettings({ ...this.plugin.rerankingSettings, enabled }); }
+        finally { toggle.setValue(this.plugin.rerankingSettings.enabled); }
+      }));
+    });
+    let openrouterApiKey = this.plugin.serviceSettings.openrouterApiKey ?? "";
+    const keySetting = new Setting(root).setName("OpenRouter API key").setDesc("Stored in the local credential file outside the vault, not in data.json. Save an empty value to remove it.");
+    keySetting.addText(input => {
+      input.inputEl.type = "password";
+      input.inputEl.autocomplete = "off";
+      input.setValue(openrouterApiKey).onChange(value => { openrouterApiKey = value; });
+    });
+    keySetting.addButton(button => button.setButtonText("Save key").onClick(() => this.plugin.run(async () => {
+      button.setDisabled(true);
+      try {
+        await this.plugin.setOpenRouterApiKey(openrouterApiKey);
+        new Notice(openrouterApiKey.trim() ? "OpenRouter API key saved" : "OpenRouter API key removed");
+      } finally { button.setDisabled(false); }
+    })));
     root.createEl("h2", { text: "Similarity graph" });
     new Setting(root).setName("Edge cutoff").setDesc("Minimum cosine similarity for a visible Search-mode edge. Connections always shows one labelled edge from the current note to each result. Rankings never change.").addDropdown(dropdown => {
       dropdown.addOption("-1", "Show all edges");
