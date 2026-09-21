@@ -36,6 +36,16 @@ Copy `release/local-semantic-search` into a test vault's `.obsidian/plugins/`, t
 
 Original Markdown files are not modified. Frontmatter is filter metadata, not embedding input. `#status/inbox`, `#type/private`, their subtags, and `ai_index: false` are excluded. Weaviate is authenticated and loopback-only; managed data and credentials live outside the vault. Unloading the plugin leaves Weaviate running.
 
+## Optional JEV reranking
+
+Search has a manual **Rerank with JEV** action. It is off by default and separate from local model-download approval. In settings, choose OpenRouter or direct TypeSafe, save that provider's key, explicitly allow query/excerpt uploads on this device, and enable manual reranking. The synthetic connection test sends built-in arithmetic only, not vault text.
+
+Local results appear first. An explicit rerank widens the admitted pool to at most 60 notes, judges one or two distinct stored passages per note, and selects the final 30. The original retrieval window remains the fallback; normalized hybrid scores from different windows are never mixed. JEV relevance is shown separately from hybrid scores and true graph cosine. **Use local ranking** restores the original order; a completed ranking waits for **Apply** while you are interacting with the results.
+
+`ai_remote: false` (also `ai_rerank: false`) and remote file/folder exclusions veto upload without removing a note from local search. A mixed eligible/private pool skips the whole rerank. Missing metadata, stale snapshots, revocation, and changed search intent fail closed. Keys and provider-specific consent live in `~/.local/share/obsidian-local-semantic/<vaultId>/rerank-credentials.json`, not vault `data.json`. That file is permission-restricted, not encrypted. Titles and excerpt text can still contain sensitive information; minimization is not anonymization. Nothing automatically follows wikilinks or uploads whole notes.
+
+This is an opt-in experiment, not a demonstrated relevance improvement. Single-pair requests are the reference default; candidate-isolated batching is a separately labeled experimental setting. The two-second deadline may cause cold, large pools to retain local results. There are no retries or silent provider switches. Automatic reranking and both Connections modes remain local-only. See [implementation decisions, limits, validation, and deferred gates](docs/jev-reranking.md).
+
 ## Poorly explained benchmarks
 
 Local Jina v2 Small runs, fp32, 3,584-token windows. The main retrieval benchmarks use LLM relevance labels, not human ground truth. nDCG@10 roughly means “did the relevant notes end up near the top?” Higher is better.

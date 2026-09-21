@@ -444,7 +444,9 @@ export class WeaviateClient {
     }).sort((left, right) => right.score - left.score || compare(text(left.item.noteId), text(right.item.noteId)) || compare(left.passage.passageId, right.passage.passageId));
     const grouped = new Map<string, SearchResult>();
     const ids = new Set<string>();
-    for (const { item, score, passage } of items) {
+    for (const [retrievalRank, { item, score, passage }] of items.entries()) {
+      passage.retrievalScore = score;
+      passage.retrievalRank = retrievalRank;
       const noteId = text(item.noteId);
       const key = `${noteId}\0${passage.passageId}`;
       if (ids.has(key)) throw new Error("Weaviate returned a duplicate passage");

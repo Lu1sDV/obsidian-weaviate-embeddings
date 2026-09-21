@@ -34,13 +34,19 @@ export function cosineSimilarity(left: readonly number[], right: readonly number
 
 /** Preserve the retrieval ranking; admission removes entries, never changes scores. */
 export function visibleResults(candidates: readonly SearchResult[], admitted: (result: SearchResult) => boolean): SearchResult[] {
+  return admittedResults(candidates, admitted, 30);
+}
+
+/** A separate cap keeps rerank pool expansion from changing the existing display contract. */
+export function admittedResults(candidates: readonly SearchResult[], admitted: (result: SearchResult) => boolean, limit: number): SearchResult[] {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1200) throw new Error("Invalid admitted candidate limit");
   const seen = new Set<string>();
   const results: SearchResult[] = [];
   for (const result of candidates) {
     if (!Number.isFinite(result.score) || seen.has(result.noteId) || !admitted(result)) continue;
     seen.add(result.noteId);
     results.push(result);
-    if (results.length === 30) break;
+    if (results.length === limit) break;
   }
   return results;
 }

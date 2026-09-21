@@ -8,7 +8,9 @@
     "dev": "node esbuild.mjs",
     "typecheck": "tsc --noEmit",
     "test": "tsx --tsconfig tests/tsconfig.json --test tests/*.test.ts",
-    "package": "npm run build && node scripts/package-worker.mjs"
+    "package": "npm run build && node scripts/package-worker.mjs",
+    "eval:rerank": "tsx scripts/evaluate-rerank.ts",
+    "test:jev-contract": "tsx scripts/jev-contract.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -1,0 +1,9 @@
+{
+  "kind": "synthetic",
+  "cases": [
+    { "id": "exact-lookup", "family": "lookup", "split": "dev", "grades": { "direct": 3, "partial": 1, "unrelated": 0 }, "rankings": { "current": ["unrelated", "partial"], "wider": ["unrelated", "partial", "direct"], "synthetic-rerank": ["direct", "partial", "unrelated"] } },
+    { "id": "counterevidence", "family": "false-premise", "split": "test", "grades": { "correction": 3, "echo": 0, "context": 1 }, "rankings": { "current": ["echo", "context", "correction"], "wider": ["context", "correction", "echo"], "synthetic-rerank": ["correction", "context", "echo"] } },
+    { "id": "code-context", "family": "code", "split": "test", "grades": { "implementation": 3, "example": 2, "keyword": 0 }, "rankings": { "current": ["example", "keyword"], "wider": ["example", "implementation", "keyword"], "synthetic-rerank": ["implementation", "example", "keyword"] } },
+    { "id": "no-answer", "family": "negative", "split": "test", "grades": { "a": 0, "b": 0 }, "rankings": { "current": ["a", "b"], "wider": ["a", "b"], "synthetic-rerank": ["b", "a"] } }
+  ]
+}
