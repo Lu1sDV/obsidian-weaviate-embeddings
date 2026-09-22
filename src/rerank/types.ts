@@ -125,6 +125,7 @@ export interface RerankMetrics {
   metricVersion: string;
   inputCandidateCount: number;
   candidateCount: number;
+  baselineWindow: number;
   candidateWindow: number;
   candidateExhausted: boolean;
   evidenceCount: number;
@@ -140,13 +141,34 @@ export interface RerankMetrics {
 export type RerankOutcome =
   | { status: "applied"; results: SearchResult[]; metrics: RerankMetrics }
   | { status: "retained" | "cancelled"; reason: RerankReason; metrics: RerankMetrics };
+export interface RerankLease {
+  sessionId: string;
+  queryEpoch: number;
+  mode: "search";
+  queryHash: string;
+  filtersHash: string;
+  generation: number;
+  embeddingFingerprint: string;
+  settingsRevision: number;
+  cloudPolicyRevision: number;
+  consentRevision: number;
+  credentialRevision: number;
+  baselineWindow: number;
+  candidateWindow: number;
+  deadlineAt: number;
+  signal: AbortSignal;
+}
+
 export interface RerankInput {
   vaultId: string;
   generation: number;
   fingerprint: string;
   query: string;
+  queryEpoch: number;
+  filtersIdentity: string;
   candidates: readonly RetrievedNoteCandidate[];
   minimumCandidateCount: number;
+  baselineWindow: number;
   candidateWindow: number;
   candidateExhausted: boolean;
   signal: AbortSignal;
