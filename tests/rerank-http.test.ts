@@ -56,9 +56,14 @@ test("the final policy check occurs before end sends any payload", async () => {
   await assert.rejects(mock.transport(options({ beforeSend: () => { if (++checks === 2) throw new RerankError("policy"); } })), reason("policy"));
   assert.equal(mock.state().calls, 1); assert.equal(mock.state().ended, false); assert.equal(mock.state().destroyed, true);
 });
-for (const status of [301, 302, 307, 401, 422, 429, 529]) test(`HTTP ${status} is sanitized, never redirected or retried`, async () => {
+for (const [status, expected, transient] of [
+  [301, "provider", false], [302, "provider", false], [307, "provider", false],
+  [401, "authentication", false], [403, "authentication", false],
+  [400, "contract", false], [422, "contract", false],
+  [429, "rate-limit", true], [500, "provider", true], [529, "provider", true],
+] as const) test(`HTTP ${status} is sanitized, never redirected or retried`, async () => {
   const mock = harness(status, Buffer.from("secret provider error body"));
-  await assert.rejects(mock.transport(options()), reason("provider", status === 429 || status >= 500));
+  await assert.rejects(mock.transport(options()), reason(expected, transient));
   assert.equal(mock.state().calls, 1); assert.equal(mock.state().destroyed, true);
 });
 test("compressed, declared oversized, streamed oversized and invalid UTF-8 responses are rejected", async () => {
