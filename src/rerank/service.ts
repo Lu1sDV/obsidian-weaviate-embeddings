@@ -2,8 +2,9 @@ import { JudgmentCache } from "./cache";
 import { hash } from "./evidence";
 import { createRemoteTransport, type RemoteTransport } from "./remote-http";
 import { planRerank } from "./planner";
+import { providerFor } from "./providers";
 import { rankNotes } from "./reduce";
-import { packRequests, parseJudgments, sameServingIdentity } from "./systemone";
+import { packRequests, sameServingIdentity } from "./systemone";
 import {
   EVIDENCE_POLICY_VERSION,
   LIMITS,
@@ -184,6 +185,8 @@ export class RerankService {
       guard();
       if ((this.failures.get(access.provider)?.until ?? 0) > performance.now()) throw new RerankError("circuit-open");
 
+      const provider = providerFor(access.provider, this.transport);
+      if (provider.requestedModel !== PROVIDERS[access.provider].model) throw new RerankError("model-change");
       const plan = planRerank(
         input.candidates,
         input.minimumCandidateCount,
@@ -257,15 +260,7 @@ export class RerankService {
             this.tokens += batch.estimatedTokens;
             metrics.requests++;
 
-            const text = await this.transport({
-              provider: access.provider,
-              apiKey: access.apiKey,
-              body: batch.body,
-              signal: job.signal,
-              deadlineAt,
-              beforeSend: guard,
-            });
-            const response = parseJudgments(text, access.provider, batch.records.map(record => record.key));
+            const response = await provider.evaluate(batch, access.apiKey, job.signal, deadlineAt, guard);
             metrics.inputTokens += response.inputTokens;
             metrics.outputTokens += response.outputTokens;
             metrics.cost += response.cost ?? 0;
