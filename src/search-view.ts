@@ -2,7 +2,7 @@ import { ItemView, Keymap, Menu, TFile, WorkspaceLeaf } from "obsidian";
 import { EmbeddingClient } from "./embeddings";
 import type { PathPolicy } from "./exclusions";
 import { buildConnectionGraph, buildSimilarityGraph, visibleResults, type SimilarityGraphData } from "./graph";
-import { expandSearchPool, type SearchWindow } from "./retrieval-service";
+import { expandSearchPool } from "./search/retrieval-service";
 import { remoteNoteAllowed } from "./rerank/policy";
 import type { RerankService } from "./rerank/service";
 import type { RerankStore } from "./rerank/store";
@@ -12,7 +12,7 @@ import { stripFrontmatter } from "./policy-core";
 import { canonicalJson, PropertyRegistry } from "./properties";
 import { SimilarityGraph, type GraphSelection } from "./similarity-graph";
 import type { PersistedState, PropertyFilter, PropertyKind, SearchResult } from "./types";
-import { WeaviateClient } from "./weaviate";
+import { WeaviateClient, type HybridWindow, type RetrievedNoteCandidate } from "./weaviate";
 
 export const VIEW_TYPE = "local-semantic-search";
 type Mode = "connections" | "search";
@@ -21,7 +21,7 @@ interface PassageTarget { noteId: string; snapshotId: string; passage: Passage; 
 interface ModeMemory { filters: PropertyFilter[]; expanded: Map<string, string>; scroll: number }
 interface QueryContext { epoch: number; mode: Mode; generation: number; fingerprint: string; anchor?: SearchResult; targetPassageId?: string }
 interface SearchSeed {
-  context: QueryContext; query: string; filters: PropertyFilter[]; vector: number[]; window: SearchWindow;
+  context: QueryContext; query: string; filters: PropertyFilter[]; vector: number[]; window: HybridWindow;
   baseline: SearchResult[]; graph: SimilarityGraphData | undefined; graphFailed: boolean; exhausted: boolean;
 }
 interface PendingRanking {
@@ -55,7 +55,7 @@ export class SemanticSearchView extends ItemView {
   private pendingInspection: { selection: GraphSelection; context: QueryContext; epoch: number } | undefined;
   private searchSeed: SearchSeed | undefined;
   private rerankJob: AbortController | undefined;
-  private rerankCandidates: readonly SearchResult[] = [];
+  private rerankCandidates: readonly RetrievedNoteCandidate[] = [];
   private pendingRanking: PendingRanking | undefined;
   private reranked = false;
   private interactionEpoch = 0;
@@ -121,8 +121,8 @@ export class SemanticSearchView extends ItemView {
   }
 
   invalidate(noteId?: string): void {
-    if (!noteId || this.rerankCandidates.some(result => result.noteId === noteId)
-      || this.searchSeed?.window.candidates.some(result => result.noteId === noteId)) {
+    if (!noteId || this.rerankCandidates.some(candidate => candidate.result.noteId === noteId)
+      || this.searchSeed?.window.notes.some(candidate => candidate.result.noteId === noteId)) {
       if (this.reranked && this.searchSeed) this.publishRanking(this.searchSeed.baseline, this.searchSeed.graph, this.searchSeed.graphFailed, false);
       this.cancelRerank();
       this.searchSeed = undefined;
@@ -537,21 +537,24 @@ export class SemanticSearchView extends ItemView {
       let candidates: SearchResult[] = [];
       let results: SearchResult[] = [];
       let exhausted = false;
-      let searchWindow: SearchWindow | undefined;
+      let searchWindow: HybridWindow | undefined;
       // Each window replaces the prior hybrid ranking: fusion scores are window-local.
       const budgets = mode === "connections" ? [90, 300, 1200] : [300, 600, 1200];
       for (const limit of budgets) {
         if (!this.contextCurrent(context)) return;
-        candidates = context.anchor
-          ? context.targetPassageId
+        if (context.anchor) {
+          candidates = context.targetPassageId
             ? await this.weaviate.connectionsForPassage(generation, context.fingerprint, context.anchor.noteId, context.anchor.snapshotId, context.targetPassageId, filters, this.registry, limit)
-            : await this.weaviate.connectionsForNote(generation, context.fingerprint, context.anchor.noteId, context.anchor.snapshotId, filters, this.registry, limit)
-          : await this.weaviate.hybrid(generation, context.fingerprint, query, queryVector!, filters, this.registry, limit);
+            : await this.weaviate.connectionsForNote(generation, context.fingerprint, context.anchor.noteId, context.anchor.snapshotId, filters, this.registry, limit);
+        } else {
+          const detailed = await this.weaviate.hybridDetailed(generation, context.fingerprint, query, queryVector!, filters, this.registry, limit);
+          searchWindow = detailed;
+          candidates = detailed.notes.map(candidate => candidate.result);
+        }
         if (!this.contextCurrent(context)) return;
-        if (mode === "search") searchWindow = { candidates: structuredClone(candidates), limit };
         results = visibleResults(candidates, (result) => result.noteId !== context.anchor?.noteId && this.resultCurrent(result, context));
         if (results.length === 30) break;
-        const candidateCount = mode === "connections" ? candidates.length : candidates.reduce((count, note) => count + note.passages.length, 0);
+        const candidateCount = mode === "connections" ? candidates.length : searchWindow?.passages.length ?? 0;
         if (candidateCount < limit) break;
         exhausted = limit === 1200;
       }
@@ -649,7 +652,7 @@ export class SemanticSearchView extends ItemView {
     if (unavailable) { this.rerankStatus.setText(`Local results retained — ${REASON_LABELS[unavailable]}`); return; }
     const job = new AbortController();
     this.rerankJob = job;
-    this.rerankCandidates = seed.window.candidates;
+    this.rerankCandidates = seed.window.notes;
     const interaction = this.interactionEpoch;
     const current = () => !job.signal.aborted && this.searchSeed === seed && this.contextCurrent(seed.context)
       && this.query === seed.query && canonicalJson(this.memory.search.filters) === canonicalJson(seed.filters)
@@ -658,15 +661,27 @@ export class SemanticSearchView extends ItemView {
     this.updateRerankControls();
     this.rerankStatus.setText("Preparing bounded JEV evidence; local results remain available…");
     try {
-      const pool = await expandSearchPool(seed.window, limit => this.weaviate.hybrid(seed.context.generation, seed.context.fingerprint,
+      const expansion = await expandSearchPool(seed.window, limit => this.weaviate.hybridDetailed(seed.context.generation, seed.context.fingerprint,
         seed.query, seed.vector, seed.filters, this.registry, limit), result => this.resultCurrent(result, seed.context), current);
-      if (!pool || !current()) return;
+      if (!expansion || !current()) return;
+      const pool = expansion.candidates;
       this.rerankCandidates = pool;
-      const snapshotsCurrent = () => current() && pool.every(result => this.resultCurrent(result, seed.context));
-      const allowed = () => snapshotsCurrent() && pool.every(result => this.remoteAllowed(result, seed.context));
+      const snapshotsCurrent = () => current() && pool.every(candidate => this.resultCurrent(candidate.result, seed.context));
+      const allowed = () => snapshotsCurrent() && pool.every(candidate => this.remoteAllowed(candidate.result, seed.context));
       this.rerankStatus.setText("Reranking with JEV; local results remain available…");
-      const outcome = await this.reranker.run({ vaultId: this.state.vaultId, generation: seed.context.generation, fingerprint: seed.context.fingerprint,
-        query: seed.query, candidates: pool, signal: job.signal, isCurrent: snapshotsCurrent, isAllowed: result => this.remoteAllowed(result, seed.context) });
+      const outcome = await this.reranker.run({
+        vaultId: this.state.vaultId,
+        generation: seed.context.generation,
+        fingerprint: seed.context.fingerprint,
+        query: seed.query,
+        candidates: pool,
+        minimumCandidateCount: Math.max(1, seed.baseline.length),
+        candidateWindow: expansion.window.limit,
+        candidateExhausted: expansion.candidateExhausted,
+        signal: job.signal,
+        isCurrent: snapshotsCurrent,
+        isAllowed: candidate => this.remoteAllowed(candidate.result, seed.context),
+      });
       if (!current()) return;
       if (outcome.status !== "applied") {
         this.rerankStatus.setText(`Local results retained — ${REASON_LABELS[outcome.reason]}`); return;
@@ -703,7 +718,7 @@ export class SemanticSearchView extends ItemView {
     this.applyRerankButton.hidden = true;
     this.publishRanking(pending.results, pending.graph, pending.graphFailed, true);
     const metrics = pending.metrics;
-    this.rerankStatus.setText(`JEV relevance · ${metrics.resolvedModel} · ${metrics.evidenceCount} passages · ${metrics.cacheHits} cached${metrics.truncatedCount ? ` · ${metrics.truncatedCount} bounded excerpts` : ""}`);
+    this.rerankStatus.setText(`JEV relevance · ${metrics.servedModel ?? metrics.requestedModel} · ${metrics.evidenceCount} passages · ${metrics.cacheHits} cached${metrics.truncatedCount ? ` · ${metrics.truncatedCount} bounded excerpts` : ""}`);
   }
 
   private publishRanking(results: readonly SearchResult[], graph: SimilarityGraphData | undefined, graphFailed: boolean, reranked: boolean): void {
