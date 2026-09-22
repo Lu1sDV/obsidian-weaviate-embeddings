@@ -1,5 +1,6 @@
-import type { SearchResult } from "../types";
-import type { HybridWindow, RetrievedNoteCandidate } from "../weaviate";
+import type { PropertyRegistry } from "../properties";
+import type { PropertyFilter, SearchResult } from "../types";
+import type { HybridWindow, RetrievedNoteCandidate, WeaviateClient } from "../weaviate";
 
 export const SEARCH_WINDOWS = [300, 600, 1200] as const;
 
@@ -7,6 +8,14 @@ export interface ExpandedSearchPool {
   candidates: readonly RetrievedNoteCandidate[];
   window: HybridWindow;
   candidateExhausted: boolean;
+}
+
+export interface SearchRetrievalQuery {
+  generation: number;
+  fingerprint: string;
+  query: string;
+  vector: readonly number[];
+  filters: readonly PropertyFilter[];
 }
 
 function admittedCandidates(window: HybridWindow, admitted: (result: SearchResult) => boolean, limit: number): RetrievedNoteCandidate[] {
@@ -42,4 +51,33 @@ export async function expandSearchPool(
     if (window.limit !== limit) throw new Error("Expanded Search returned the wrong retrieval window");
   }
   return undefined;
+}
+
+/** Owns Search candidate retrieval so the view renders snapshots rather than defining retrieval semantics. */
+export class SearchRetrievalService {
+  constructor(
+    private readonly database: WeaviateClient,
+    private readonly registry: PropertyRegistry,
+  ) {}
+
+  retrieve(request: SearchRetrievalQuery, limit: number): Promise<HybridWindow> {
+    return this.database.hybridDetailed(
+      request.generation,
+      request.fingerprint,
+      request.query,
+      [...request.vector],
+      request.filters,
+      this.registry,
+      limit,
+    );
+  }
+
+  expand(
+    initial: HybridWindow,
+    request: SearchRetrievalQuery,
+    admitted: (result: SearchResult) => boolean,
+    current: () => boolean,
+  ): Promise<ExpandedSearchPool | undefined> {
+    return expandSearchPool(initial, limit => this.retrieve(request, limit), admitted, current);
+  }
 }
