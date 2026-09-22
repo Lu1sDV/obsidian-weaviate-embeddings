@@ -110,14 +110,34 @@ export interface PersistedState {
   presets: Record<string, PropertyFilter[]>;
 }
 
-export interface RerankMetadata {
-  provider: "openrouter" | "typesafe";
-  requestedModel: string;
-  resolvedModel: string;
-  metricVersion: string;
+export interface PassageRerankJudgment {
+  passageId: string;
+  evidenceHash: string;
+  retrievalRank: number;
   relevance: number;
-  winningPassageId: string;
+}
+
+export interface RerankMetadata {
+  route: "openrouter" | "typesafe";
+  requestedModel: string;
+  servedModel: string;
+  upstreamProvider?: string;
+  rubricVersion: string;
+  evidencePolicyVersion: string;
+  rankingPolicyVersion: string;
+  relevance: number;
+  bestPassageId: string;
   evidenceCount: number;
+  coverage: "complete";
+  judgments: readonly PassageRerankJudgment[];
+}
+
+export interface SearchPassage {
+  passageId: string;
+  heading: string;
+  body: string;
+  startLine: number;
+  endLine: number;
 }
 
 export interface SearchResult {
@@ -128,6 +148,5 @@ export interface SearchResult {
   score: number;
   scoreKind: "similarity" | "hybrid";
   rerank?: RerankMetadata;
-  passages: Array<{ passageId: string; heading: string; body: string; startLine: number; endLine: number;
-    retrievalScore?: number; retrievalRank?: number; rerankRelevance?: number }>;
+  passages: SearchPassage[];
 }
