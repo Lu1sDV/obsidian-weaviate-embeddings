@@ -1,7 +1,7 @@
 name: Checks
 on:
   push:
-    branches: [master, 'feat/jev-search-reranking', 'feat/jev-reranking-architecture']
+    branches: [master, 'feat/jev-*']
   pull_request:
 permissions:
   contents: read
