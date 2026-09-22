@@ -756,7 +756,7 @@ export class SemanticSearchView extends ItemView {
       article.createDiv({ text: result.path, cls: "local-semantic-result-path" });
       article.createDiv({ text: result.scoreKind === "similarity" ? `${context.targetPassageId ? "Passage" : "Note"} cosine ${result.score.toFixed(6)}` : `Hybrid rank score ${result.score.toFixed(6)}`, cls: "local-semantic-score" });
       if (result.rerank) article.createDiv({ text: `JEV relevance ${result.rerank.relevance.toFixed(6)}`, cls: "local-semantic-score",
-        attr: { title: `${result.rerank.provider} · ${result.rerank.resolvedModel} · ${result.rerank.metricVersion}` } });
+        attr: { title: `${result.rerank.route} · ${result.rerank.servedModel} · ${result.rerank.rubricVersion} · ${result.rerank.evidencePolicyVersion} · ${result.rerank.rankingPolicyVersion}` } });
       const passages = article.createDiv({ cls: "local-semantic-passages" });
       passages.hidden = true;
       const show = async () => {
