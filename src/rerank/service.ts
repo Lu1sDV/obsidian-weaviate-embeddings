@@ -17,6 +17,7 @@ import {
   type Provider,
   type RerankAccess,
   type RerankInput,
+  type RerankLease,
   type RerankMetrics,
   type RerankOutcome,
   type ServingIdentity,
@@ -127,8 +128,11 @@ export class RerankService {
       generation: 0,
       fingerprint: "synthetic",
       query: "What is two plus two?",
+      queryEpoch: 0,
+      filtersIdentity: "[]",
       candidates: [syntheticCandidate()],
       minimumCandidateCount: 1,
+      baselineWindow: 1,
       candidateWindow: 1,
       candidateExhausted: true,
       signal,
@@ -149,6 +153,7 @@ export class RerankService {
       metricVersion: `${RUBRIC_VERSION}/${EVIDENCE_POLICY_VERSION}/${RANKING_POLICY_VERSION}`,
       inputCandidateCount: input.candidates.length,
       candidateCount: 0,
+      baselineWindow: input.baselineWindow,
       candidateWindow: input.candidateWindow,
       candidateExhausted: input.candidateExhausted,
       evidenceCount: 0,
@@ -163,6 +168,23 @@ export class RerankService {
     };
 
     const job = new AbortController();
+    const lease: RerankLease = {
+      sessionId: crypto.randomUUID(),
+      queryEpoch: input.queryEpoch,
+      mode: "search",
+      queryHash: hash(input.query),
+      filtersHash: hash(input.filtersIdentity),
+      generation: input.generation,
+      embeddingFingerprint: input.fingerprint,
+      settingsRevision: access.settingsRevision,
+      cloudPolicyRevision: access.cloudPolicyRevision,
+      consentRevision: access.consentRevision,
+      credentialRevision: access.credentialRevision,
+      baselineWindow: input.baselineWindow,
+      candidateWindow: input.candidateWindow,
+      deadlineAt,
+      signal: job.signal,
+    };
     const cancel = () => job.abort(new RerankError("cancelled"));
     if (input.signal.aborted) cancel();
     else input.signal.addEventListener("abort", cancel, { once: true });
@@ -170,12 +192,17 @@ export class RerankService {
     this.jobs.add(job);
 
     const guard = () => {
+      const currentAccess = this.access();
       if (this.disposed || revision !== this.revision || !input.isCurrent()
-        || this.access().revision !== access.revision) throw new RerankError("cancelled");
-      if (job.signal.aborted) {
-        throw job.signal.reason instanceof RerankError ? job.signal.reason : new RerankError("cancelled");
+        || currentAccess.revision !== access.revision
+        || currentAccess.settingsRevision !== lease.settingsRevision
+        || currentAccess.cloudPolicyRevision !== lease.cloudPolicyRevision
+        || currentAccess.consentRevision !== lease.consentRevision
+        || currentAccess.credentialRevision !== lease.credentialRevision) throw new RerankError("cancelled");
+      if (lease.signal.aborted) {
+        throw lease.signal.reason instanceof RerankError ? lease.signal.reason : new RerankError("cancelled");
       }
-      if (performance.now() >= deadlineAt) throw new RerankError("deadline");
+      if (performance.now() >= lease.deadlineAt) throw new RerankError("deadline");
       if (!synthetic && !access.enabled) throw new RerankError("off");
       if (!access.apiKey) throw new RerankError("unconfigured");
       if (!synthetic && (!access.consent || !input.candidates.every(input.isAllowed))) throw new RerankError("policy");
@@ -198,7 +225,6 @@ export class RerankService {
       metrics.evidenceCount = plan.records.length;
       metrics.truncatedCount = plan.records.filter(record => record.truncated).length;
 
-      const queryHash = hash(input.query);
       const known = this.resolved.get(access.provider);
       const key = (record: EvidenceRecord, serving: ServingIdentity) => hash([
         input.vaultId,
@@ -210,18 +236,19 @@ export class RerankService {
         RUBRIC_VERSION,
         EVIDENCE_POLICY_VERSION,
         RANKING_POLICY_VERSION,
-        queryHash,
-        "search",
-        input.generation,
-        input.fingerprint,
+        lease.queryHash,
+        lease.filtersHash,
+        lease.mode,
+        lease.generation,
+        lease.embeddingFingerprint,
         record.noteId,
         record.snapshotId,
         record.passageId,
         record.hash,
-        access.settingsRevision,
-        access.cloudPolicyRevision,
-        access.consentRevision,
-        access.credentialRevision,
+        lease.settingsRevision,
+        lease.cloudPolicyRevision,
+        lease.consentRevision,
+        lease.credentialRevision,
       ]);
 
       const scores = new Map<string, number>();
@@ -260,7 +287,7 @@ export class RerankService {
             this.tokens += batch.estimatedTokens;
             metrics.requests++;
 
-            const response = await provider.evaluate(batch, access.apiKey, job.signal, deadlineAt, guard);
+            const response = await provider.evaluate(batch, access.apiKey, lease.signal, lease.deadlineAt, guard);
             metrics.inputTokens += response.inputTokens;
             metrics.outputTokens += response.outputTokens;
             metrics.cost += response.cost ?? 0;
