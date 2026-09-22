@@ -111,6 +111,39 @@ test("hybrid grouping retains the best real passage score with deterministic not
   });
 });
 
+test("hybridDetailed preserves flat passage provenance while legacy hybrid projection stays identical", async () => {
+  const hit = (noteId: string, passageId: string, score: string) => ({
+    ...identity,
+    noteId,
+    snapshotId: `snapshot-${noteId}`,
+    path: `${noteId}.md`,
+    title: `Stored ${noteId}`,
+    passageId,
+    heading: "Section",
+    body: `Body ${passageId}`,
+    startLine: 2,
+    endLine: 4,
+    _additional: { score },
+  });
+  const rows = [hit("note-b", "low", "0.1"), hit("note-b", "best", "0.9"), hit("note-a", "tied", "0.9")];
+  await withBackend(() => ({ data: { Get: { LocalSemantic_synthetic_vault_PassagesG1: rows } } }), async (url) => {
+    const database = client(url);
+    const registry = new PropertyRegistry();
+    const detailed = await database.hybridDetailed(1, DEFAULT_MODEL.modelFingerprint, "synthetic query", vector, [], registry, 300);
+    const legacy = await database.hybrid(1, DEFAULT_MODEL.modelFingerprint, "synthetic query", vector, [], registry, 300);
+    assert.deepEqual(detailed.notes.map(candidate => candidate.result), legacy);
+    assert.deepEqual(detailed.passages.map(passage => [passage.noteId, passage.passageId, passage.retrievalScore, passage.retrievalRank]), [
+      ["note-a", "tied", 0.9, 0],
+      ["note-b", "best", 0.9, 1],
+      ["note-b", "low", 0.1, 2],
+    ]);
+    assert.deepEqual(detailed.notes.map(candidate => [candidate.result.noteId, candidate.noteRank, candidate.passages.map(passage => passage.passageId)]), [
+      ["note-a", 0, ["tied"]],
+      ["note-b", 1, ["best", "low"]],
+    ]);
+  });
+});
+
 test("passage connections retain global cosine order for strongest-per-note admission", async () => {
   const hit = (noteId: string, passageId: string, distance: number) => ({
     ...identity,
