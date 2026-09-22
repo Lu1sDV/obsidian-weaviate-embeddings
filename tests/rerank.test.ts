@@ -242,7 +242,7 @@ test("packed requests use query-only state, opaque keys, and at most 24 independ
 });
 
 test("planner deterministically shrinks two-passage cohorts rather than scoring a prefix", () => {
-  const items = Array.from({ length: 60 }, (_, index) => candidate(index, 2, 1200));
+  const items = Array.from({ length: 60 }, (_, index) => candidate(index, 2, 800));
   const plan = planRerank(items, 30, "Evidence", "typesafe", 2);
   assert.equal(plan.candidates.length, 30);
   assert.equal(plan.records.length, 60);
