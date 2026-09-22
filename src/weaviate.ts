@@ -31,6 +31,32 @@ export interface PassageObject {
   properties: NormalizedProperties;
 }
 
+export interface RetrievedPassageCandidate {
+  noteId: string;
+  snapshotId: string;
+  path: string;
+  storedTitle: string;
+  passageId: string;
+  heading: string;
+  body: string;
+  startLine: number;
+  endLine: number;
+  retrievalScore: number;
+  retrievalRank: number;
+}
+
+export interface RetrievedNoteCandidate {
+  result: SearchResult;
+  noteRank: number;
+  passages: readonly RetrievedPassageCandidate[];
+}
+
+export interface HybridWindow {
+  limit: number;
+  notes: readonly RetrievedNoteCandidate[];
+  passages: readonly RetrievedPassageCandidate[];
+}
+
 const graphqlEnumFields: Record<string, true> = { operator: true, fusionType: true, order: true };
 
 function gql(value: unknown): string {
@@ -428,36 +454,55 @@ export class WeaviateClient {
     return [...grouped.values()].sort(rank);
   }
 
-  async hybrid(generation: number, fingerprint: string, textQuery: string, vector: number[], filters: readonly PropertyFilter[], registry: PropertyRegistry, limit = 300): Promise<SearchResult[]> {
+  async hybridDetailed(generation: number, fingerprint: string, textQuery: string, vector: number[], filters: readonly PropertyFilter[], registry: PropertyRegistry, limit = 300): Promise<HybridWindow> {
     const profile = this.profile;
     const className = this.classNames(generation).passages;
     knownFingerprint(fingerprint, profile); validateUnitVector(vector, profile.dimensions);
     if (typeof textQuery !== "string" || Buffer.byteLength(textQuery) > 4 * 1024 * 1024) throw new Error("Invalid hybrid query");
     const window = candidateLimit(limit);
     const hybrid = { query: textQuery, vector, alpha: 0.5, fusionType: "relativeScoreFusion", targetVectors: ["content"], properties: ["title^2", "heading", "body"] };
-    // Recompute the whole bounded window: relative fusion scores from different windows cannot be merged.
+    // Recompute the complete bounded window. Relative-score-fusion values from different windows are never merged.
     const data = await this.graphql(`{Get{${className}(hybrid:${gql(hybrid)},where:${gql(this.where(generation, fingerprint, filters, registry))},limit:${window}){vaultId generation modelFingerprint noteId path title snapshotId passageId heading body startLine endLine _additional{score}}}}`);
     this.checkProfile(profile);
     const items = rows(data, className, window).map((item) => {
       this.checkIdentity(item, generation, fingerprint);
       return { item, score: additionalNumber(item, "score"), passage: passageFields(item) };
     }).sort((left, right) => right.score - left.score || compare(text(left.item.noteId), text(right.item.noteId)) || compare(left.passage.passageId, right.passage.passageId));
-    const grouped = new Map<string, SearchResult>();
+    const grouped = new Map<string, { result: SearchResult; passages: RetrievedPassageCandidate[] }>();
+    const passages: RetrievedPassageCandidate[] = [];
     const ids = new Set<string>();
     for (const [retrievalRank, { item, score, passage }] of items.entries()) {
-      passage.retrievalScore = score;
-      passage.retrievalRank = retrievalRank;
       const noteId = text(item.noteId);
+      const snapshotId = text(item.snapshotId);
+      const path = text(item.path);
+      const storedTitle = text(item.title);
       const key = `${noteId}\0${passage.passageId}`;
       if (ids.has(key)) throw new Error("Weaviate returned a duplicate passage");
       ids.add(key);
+      const detailed: RetrievedPassageCandidate = { noteId, snapshotId, path, storedTitle,
+        passageId: passage.passageId, heading: passage.heading, body: passage.body,
+        startLine: passage.startLine, endLine: passage.endLine, retrievalScore: score, retrievalRank };
+      passages.push(detailed);
       const existing = grouped.get(noteId);
       if (existing) {
-        if (existing.snapshotId !== item.snapshotId || existing.path !== item.path || existing.title !== item.title) throw new Error("Weaviate returned competing passage snapshots");
-        existing.passages.push(passage);
-      } else grouped.set(noteId, { noteId, path: text(item.path), title: text(item.title), snapshotId: text(item.snapshotId), score, scoreKind: "hybrid", passages: [passage] });
+        if (existing.result.snapshotId !== snapshotId || existing.result.path !== path || existing.result.title !== storedTitle) throw new Error("Weaviate returned competing passage snapshots");
+        existing.result.passages.push(passage);
+        existing.passages.push(detailed);
+      } else {
+        grouped.set(noteId, {
+          result: { noteId, path, title: storedTitle, snapshotId, score, scoreKind: "hybrid", passages: [passage] },
+          passages: [detailed],
+        });
+      }
     }
-    return [...grouped.values()].sort(rank);
+    const notes = [...grouped.values()].sort((left, right) => rank(left.result, right.result))
+      .map(({ result, passages: notePassages }, noteRank): RetrievedNoteCandidate => ({ result, noteRank, passages: notePassages }));
+    return { limit: window, notes, passages };
+  }
+
+  async hybrid(generation: number, fingerprint: string, textQuery: string, vector: number[], filters: readonly PropertyFilter[], registry: PropertyRegistry, limit = 300): Promise<SearchResult[]> {
+    const detailed = await this.hybridDetailed(generation, fingerprint, textQuery, vector, filters, registry, limit);
+    return detailed.notes.map(candidate => structuredClone(candidate.result));
   }
 
   private async graphql(query: string): Promise<Record<string, unknown>> {
