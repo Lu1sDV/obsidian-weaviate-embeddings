@@ -2,7 +2,7 @@ import { ItemView, Keymap, Menu, TFile, WorkspaceLeaf } from "obsidian";
 import { EmbeddingClient } from "./embeddings";
 import type { PathPolicy } from "./exclusions";
 import { buildConnectionGraph, buildSimilarityGraph, visibleResults, type SimilarityGraphData } from "./graph";
-import { expandSearchPool } from "./search/retrieval-service";
+import { SearchRetrievalService } from "./search/retrieval-service";
 import { remoteNoteAllowed } from "./rerank/policy";
 import type { RerankService } from "./rerank/service";
 import type { RerankStore } from "./rerank/store";
@@ -63,6 +63,7 @@ export class SemanticSearchView extends ItemView {
   private applyRerankButton!: HTMLButtonElement;
   private rerankStatus!: HTMLElement;
   private readonly passageRequests = new Map<string, Promise<SearchResult["passages"]>>();
+  private readonly searchRetrieval: SearchRetrievalService;
   private readonly memory: Record<Mode, ModeMemory> = {
     connections: { filters: [], expanded: new Map(), scroll: 0 },
     search: { filters: [], expanded: new Map(), scroll: 0 },
@@ -92,7 +93,10 @@ export class SemanticSearchView extends ItemView {
     private edgeCutoff: number,
     private readonly reranker?: RerankService,
     private readonly rerankStore?: RerankStore,
-  ) { super(leaf); }
+  ) {
+    super(leaf);
+    this.searchRetrieval = new SearchRetrievalService(weaviate, registry);
+  }
 
   getViewType(): string { return VIEW_TYPE; }
   getDisplayText(): string { return "Local semantic search"; }
@@ -547,7 +551,13 @@ export class SemanticSearchView extends ItemView {
             ? await this.weaviate.connectionsForPassage(generation, context.fingerprint, context.anchor.noteId, context.anchor.snapshotId, context.targetPassageId, filters, this.registry, limit)
             : await this.weaviate.connectionsForNote(generation, context.fingerprint, context.anchor.noteId, context.anchor.snapshotId, filters, this.registry, limit);
         } else {
-          const detailed = await this.weaviate.hybridDetailed(generation, context.fingerprint, query, queryVector!, filters, this.registry, limit);
+          const detailed = await this.searchRetrieval.retrieve({
+            generation,
+            fingerprint: context.fingerprint,
+            query,
+            vector: queryVector!,
+            filters,
+          }, limit);
           searchWindow = detailed;
           candidates = detailed.notes.map(candidate => candidate.result);
         }
@@ -661,8 +671,13 @@ export class SemanticSearchView extends ItemView {
     this.updateRerankControls();
     this.rerankStatus.setText("Preparing bounded JEV evidence; local results remain available…");
     try {
-      const expansion = await expandSearchPool(seed.window, limit => this.weaviate.hybridDetailed(seed.context.generation, seed.context.fingerprint,
-        seed.query, seed.vector, seed.filters, this.registry, limit), result => this.resultCurrent(result, seed.context), current);
+      const expansion = await this.searchRetrieval.expand(seed.window, {
+        generation: seed.context.generation,
+        fingerprint: seed.context.fingerprint,
+        query: seed.query,
+        vector: seed.vector,
+        filters: seed.filters,
+      }, result => this.resultCurrent(result, seed.context), current);
       if (!expansion || !current()) return;
       const pool = expansion.candidates;
       this.rerankCandidates = pool;
