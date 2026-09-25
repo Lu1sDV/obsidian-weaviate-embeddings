@@ -7,6 +7,7 @@ import { remoteNoteAllowed } from "./rerank/policy";
 import type { RerankService } from "./rerank/service";
 import type { RerankStore } from "./rerank/store";
 import { REASON_LABELS, type RerankMetrics } from "./rerank/types";
+import { shouldClearAfterRerankInvalidation } from "./rerank/view-state";
 import { admissionFor, canonicalInput } from "./policy";
 import { stripFrontmatter } from "./policy-core";
 import { canonicalJson, PropertyRegistry } from "./properties";
@@ -125,17 +126,23 @@ export class SemanticSearchView extends ItemView {
   }
 
   invalidate(noteId?: string): void {
-    if (!noteId || this.rerankCandidates.some(candidate => candidate.result.noteId === noteId)
-      || this.searchSeed?.window.notes.some(candidate => candidate.result.noteId === noteId)) {
-      if (this.reranked && this.searchSeed) this.publishRanking(this.searchSeed.baseline, this.searchSeed.graph, this.searchSeed.graphFailed, false);
+    const rerankAffected = !noteId || this.rerankCandidates.some(candidate => candidate.result.noteId === noteId)
+      || Boolean(this.searchSeed?.window.notes.some(candidate => candidate.result.noteId === noteId));
+    const baselineRestoreRequired = rerankAffected && this.reranked;
+    let baselineRestored = !baselineRestoreRequired;
+    if (rerankAffected) {
+      if (baselineRestoreRequired && this.searchSeed) {
+        baselineRestored = this.publishRanking(this.searchSeed.baseline, this.searchSeed.graph, this.searchSeed.graphFailed, false);
+      }
       this.cancelRerank();
       this.searchSeed = undefined;
       this.updateRerankControls();
-      this.rerankStatus?.setText("Local results retained — candidate snapshots changed");
+      this.rerankStatus?.setText(baselineRestored ? "Local results retained — candidate snapshots changed" : "Reranked results cleared — local baseline snapshot changed");
     }
     if (noteId && this.targetPassage?.noteId === noteId) this.targetPassage = undefined;
-    if (!noteId || this.context?.anchor?.noteId === noteId || this.results.some((result) => result.noteId === noteId)
-      || (this.reference && this.state.pathToNoteId[this.reference.path] === noteId)) {
+    const visibleAffected = !noteId || this.context?.anchor?.noteId === noteId || this.results.some((result) => result.noteId === noteId)
+      || Boolean(this.reference && this.state.pathToNoteId[this.reference.path] === noteId);
+    if (shouldClearAfterRerankInvalidation(visibleAffected, baselineRestoreRequired, baselineRestored)) {
       this.cancelRequests();
       this.clearVisible();
       this.needsRefresh = true;
@@ -739,9 +746,9 @@ export class SemanticSearchView extends ItemView {
     this.rerankStatus.setText(`JEV relevance · ${metrics.servedModel ?? metrics.requestedModel} · ${metrics.evidenceCount} passages · ${metrics.cacheHits} cached${metrics.truncatedCount ? ` · ${metrics.truncatedCount} bounded excerpts` : ""}`);
   }
 
-  private publishRanking(results: readonly SearchResult[], graph: SimilarityGraphData | undefined, graphFailed: boolean, reranked: boolean): void {
+  private publishRanking(results: readonly SearchResult[], graph: SimilarityGraphData | undefined, graphFailed: boolean, reranked: boolean): boolean {
     const seed = this.searchSeed;
-    if (!seed || !this.contextCurrent(seed.context) || !results.every(result => this.resultCurrent(result, seed.context))) return;
+    if (!seed || !this.contextCurrent(seed.context) || !results.every(result => this.resultCurrent(result, seed.context))) return false;
     this.memory.search.scroll = this.scrollEl.scrollTop;
     this.results = structuredClone([...results]);
     this.reranked = reranked;
@@ -756,6 +763,7 @@ export class SemanticSearchView extends ItemView {
     if (graphFailed) this.resultStatusEl.createDiv({ text: "Graph unavailable: stored vectors could not be validated.", cls: "local-semantic-result-warning" });
     this.renderResults(seed.context);
     this.updateRerankControls();
+    return true;
   }
 
   private renderResults(context: QueryContext): void {

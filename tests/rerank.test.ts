@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { admittedResults, buildConnectionGraph, buildSimilarityGraph, visibleResults } from "../src/graph";
 import { expandSearchPool } from "../src/search/retrieval-service";
 import { JudgmentCache } from "../src/rerank/cache";
+import { shouldClearAfterRerankInvalidation } from "../src/rerank/view-state";
 import { selectEvidence } from "../src/rerank/evidence";
 import { planRerank } from "../src/rerank/planner";
 import { remoteNoteAllowed, validateRerankSettings } from "../src/rerank/policy";
@@ -240,16 +241,31 @@ test("packed requests use query-only state, opaque keys, and at most 24 independ
     assert.ok(batch.records.length <= 24);
     const parsed = JSON.parse(batch.body);
     assert.deepEqual(parsed.state, { query: "query" });
+    const question = Object.values(parsed.questions as Record<string, { instructions: { question: string; handling: string } }>)[0]!;
+    assert.match(question.instructions.question, /`candidate`/);
+    assert.match(question.instructions.question, /`query`/);
+    assert.match(question.instructions.handling, /`candidate`/);
+    assert.match(question.instructions.handling, /`query`/);
     assert.ok(!batch.body.includes("Private-path") && !batch.body.includes("snapshot-") && !batch.body.includes("passage-"));
   }
 });
 
-test("planner deterministically shrinks two-passage cohorts rather than scoring a prefix", () => {
+test("two-passage planning preserves the one-passage candidate cohort", () => {
   const items = Array.from({ length: 60 }, (_, index) => candidate(index, 2, 800));
-  const plan = planRerank(items, 30, "Evidence", "typesafe", 2);
-  assert.equal(plan.candidates.length, 30);
-  assert.equal(plan.records.length, 60);
-  assert.ok(plan.batches.length <= LIMITS.maxBatches);
+  const one = planRerank(items, 30, "Evidence", "typesafe", 1);
+  const two = planRerank(items, 30, "Evidence", "typesafe", 2);
+  assert.equal(one.candidates.length, 60);
+  assert.equal(two.candidates.length, one.candidates.length);
+  assert.equal(two.records.length, 120);
+  assert.ok(two.batches.length > LIMITS.maxBatches);
+  assert.ok(two.batches.length <= LIMITS.twoPassageMaxBatches);
+});
+
+test("reranked invalidation clears when an exact local baseline cannot be restored", () => {
+  assert.equal(shouldClearAfterRerankInvalidation(false, false, true), false);
+  assert.equal(shouldClearAfterRerankInvalidation(false, true, true), false);
+  assert.equal(shouldClearAfterRerankInvalidation(false, true, false), true);
+  assert.equal(shouldClearAfterRerankInvalidation(true, false, true), true);
 });
 
 const validWire = () => ({
@@ -428,6 +444,49 @@ test("snapshot invalidation prevents cache insertion and publication", async () 
   const next = await service.run(input([candidate(0)]));
   assert.equal(next.status, "applied");
   assert.equal(next.metrics.cacheHits, 0);
+});
+
+test("note-scoped invalidation cancels only affected jobs and preserves unrelated cached judgments", async () => {
+  const bothEntered = deferred<void>();
+  const releaseUnrelated = deferred<void>();
+  let entered = 0;
+  let calls = 0;
+  const service = new RerankService(() => configured(), async options => {
+    calls++;
+    if (++entered === 2) bothEntered.resolve();
+    if (options.body.includes("Evidence 0")) await wait(options.signal, 60_000);
+    else await releaseUnrelated.promise;
+    return response(options);
+  });
+
+  const affected = service.run(input([candidate(0)]));
+  const unrelated = service.run(input([candidate(1)]));
+  await bothEntered.promise;
+  service.invalidate("note-0");
+  releaseUnrelated.resolve();
+
+  assert.equal((await affected).status, "cancelled");
+  assert.equal((await unrelated).status, "applied");
+  const cached = await service.run(input([candidate(1)]));
+  assert.equal(cached.status, "applied");
+  assert.equal(cached.metrics.cacheHits, 1);
+  assert.equal(calls, 2);
+});
+
+test("two-passage service uses the experimental budget without narrowing the cohort", async () => {
+  const items = Array.from({ length: 60 }, (_, index) => candidate(index, 2, 800));
+  let calls = 0;
+  const service = new RerankService(() => configured({ evidencePassages: 2 }), async options => {
+    calls++;
+    return response(options);
+  });
+  const outcome = await service.run(input(items, { minimumCandidateCount: 30 }));
+  assert.equal(outcome.status, "applied");
+  assert.equal(outcome.metrics.candidateCount, 60);
+  assert.equal(outcome.metrics.evidenceCount, 120);
+  assert.ok(outcome.metrics.requests > LIMITS.maxBatches);
+  assert.ok(outcome.metrics.requests <= LIMITS.twoPassageMaxBatches);
+  assert.equal(calls, outcome.metrics.requests);
 });
 
 test("global concurrency is two across views and revocation cancels queued work", async () => {

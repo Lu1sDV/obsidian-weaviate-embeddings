@@ -107,7 +107,7 @@ export function renderRerankSettings(
 
   new Setting(root)
     .setName("Evidence passages per note")
-    .setDesc("One is the release default. Two is an explicit experiment with more disclosure, cost, and max-score length bias.")
+    .setDesc("One is the release default. Two is an explicit experiment with more disclosure, cost, and max-score length bias. Two-passage planning keeps the same candidate cohort chosen by the one-passage policy; if that exact cohort cannot fit the experimental budget, reranking is skipped rather than narrowed.")
     .addDropdown(dropdown => dropdown
       .addOption("1", "1 — release default")
       .addOption("2", "2 — experimental")
@@ -119,7 +119,7 @@ export function renderRerankSettings(
       })));
 
   root.createEl("p", {
-    text: "Limits: up to 60 admitted notes, 30 displayed notes, up to 24 independent candidate-local questions per packed request, two concurrent requests, a 2.5-second remote deadline, and no retries. The whole cohort is planned before the first send and can deterministically shrink toward the currently displayed count. Publication requires complete compatible judgments; otherwise the exact local ranking stays visible. The judgment cache is RAM-only with a 15-minute TTL.",
+    text: "Limits: up to 60 admitted notes, 30 displayed notes, up to 24 independent candidate-local questions per packed request, two concurrent requests, a 2.5-second remote deadline, and no retries. One-passage planning uses at most 3 batches / 64k estimated tokens. The two-passage experiment uses at most 5 batches / 128k estimated tokens and must keep the same candidate cohort chosen by one-passage planning; otherwise the exact local ranking stays visible. Publication requires complete compatible judgments. The judgment cache is RAM-only with a 15-minute TTL.",
     cls: "setting-item-description",
   });
 }

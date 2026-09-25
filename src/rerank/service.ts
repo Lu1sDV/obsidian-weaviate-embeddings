@@ -8,6 +8,7 @@ import { packRequests, sameServingIdentity } from "./systemone";
 import {
   EVIDENCE_POLICY_VERSION,
   LIMITS,
+  operationBudget,
   PRIMITIVE_VERSION,
   PROVIDERS,
   RANKING_POLICY_VERSION,
@@ -92,7 +93,7 @@ function syntheticCandidate(): RetrievedNoteCandidate {
 export class RerankService {
   private readonly cache = new JudgmentCache();
   private readonly queue = new RequestQueue();
-  private readonly jobs = new Set<AbortController>();
+  private readonly jobs = new Map<AbortController, ReadonlySet<string>>();
   private readonly resolved = new Map<Provider, ServingIdentity>();
   private readonly failures = new Map<Provider, { count: number; until: number }>();
   private requests = 0;
@@ -105,9 +106,15 @@ export class RerankService {
     private readonly transport: RemoteTransport = createRemoteTransport(),
   ) {}
 
-  invalidate(): void {
+  invalidate(noteId?: string): void {
+    if (noteId) {
+      for (const [job, candidates] of this.jobs) {
+        if (candidates.has(noteId)) job.abort(new RerankError("cancelled"));
+      }
+      return;
+    }
     this.revision++;
-    for (const job of this.jobs) job.abort(new RerankError("cancelled"));
+    for (const job of this.jobs.keys()) job.abort(new RerankError("cancelled"));
     this.cache.clear();
     this.resolved.clear();
   }
@@ -189,7 +196,7 @@ export class RerankService {
     if (input.signal.aborted) cancel();
     else input.signal.addEventListener("abort", cancel, { once: true });
     const timer = setTimeout(() => job.abort(new RerankError("deadline")), LIMITS.deadlineMs);
-    this.jobs.add(job);
+    this.jobs.set(job, new Set(input.candidates.map(candidate => candidate.result.noteId)));
 
     const guard = () => {
       const currentAccess = this.access();
@@ -265,7 +272,8 @@ export class RerankService {
       const missing = plan.records.filter(record => !scores.has(record.key));
       const batches = packRequests(access.provider, input.query, missing);
       metrics.estimatedTokens = batches.reduce((sum, batch) => sum + batch.estimatedTokens, 0);
-      if (batches.length > LIMITS.maxBatches || metrics.estimatedTokens > LIMITS.operationTokens) {
+      const operation = operationBudget(synthetic ? 1 : access.evidencePassages);
+      if (batches.length > operation.maxBatches || metrics.estimatedTokens > operation.operationTokens) {
         throw new RerankError("budget");
       }
       if (this.requests + batches.length > LIMITS.sessionRequests

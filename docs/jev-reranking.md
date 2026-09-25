@@ -29,17 +29,19 @@ The saved local baseline and the rerank pool are separate immutable concepts. Re
 
 Evidence comes only from the retrieved indexed snapshot, never newly edited live Markdown. `passage-v1` sends `title + heading + bounded passage body`. Paths, note IDs, snapshot IDs, passage IDs, vectors, retrieval scores, frontmatter objects, generation IDs, and purge state stay local. Evidence truncation is UTF-8 bounded and query-aware; minimization is not anonymization.
 
-The production policy selects exactly one strongest retrieved passage per candidate. The setting `2 — experimental` permits a second distinct non-overlapping passage. There is no neighboring-context hydration in the shipping path; a future `passage-neighbors-v1` experiment must be separately versioned because it changes disclosure and late-chunking evidence.
+The production policy selects exactly one strongest retrieved passage per candidate. The setting `2 — experimental` permits a second distinct non-overlapping passage. Candidate breadth is planned under the one-passage policy first; the two-passage arm must score that exact cohort under its larger experimental operation budget or bypass entirely, so evidence breadth cannot silently change candidate breadth. There is no neighboring-context hydration in the shipping path; a future `passage-neighbors-v1` experiment must be separately versioned because it changes disclosure and late-chunking evidence.
 
 Remote disclosure is independent of local indexing admission. A note must still be current and locally admitted, provider consent must be active, the selected route must be configured, remote folder/file exclusions must allow the path, and `ai_remote: false` / `ai_rerank: false` must not veto it. If any note required by the selected cohort is remote-ineligible, the whole rerank is skipped and the local baseline remains.
 
 ## Planning and request representation
 
-`planRerank()` plans a complete cohort before any network write. It attempts the available candidate count, then deterministic smaller cohorts (including 48, 40, 30 and the current display floor) until the complete evidence/request plan fits. If the current displayed note count itself cannot fit, the rerank is bypassed.
+`planRerank()` plans a complete cohort before any network write. Candidate breadth is chosen once using the release one-passage policy: it attempts the available candidate count, then deterministic smaller cohorts (including 48, 40, 30 and the current display floor) until that complete plan fits. If the current displayed note count itself cannot fit, the rerank is bypassed.
+
+The two-passage experiment then reuses exactly that candidate cohort. It receives a larger bounded operation budget (up to five packed requests and 128k conservative estimated tokens across the operation, versus three / 64k for one passage). Each individual request remains under the existing 24k conservative estimate. If the exact cohort still cannot fit, the rerank is bypassed instead of shrinking to a different candidate set.
 
 Planning uses both serialized-byte bounds and a conservative token estimate. The estimate is not presented as the JEV tokenizer. Provider-reported usage is retained separately in content-free operation metrics.
 
-Each System One request has shared `state.query`; each opaque question contains one candidate evidence object plus the fixed `search-relevance-noul-v1` rubric. Packed questions are independent candidate-local judgments. A singleton request mode remains in the developer contract probe as the comparison oracle for packing experiments.
+Each System One request has shared `state.query`; each opaque question contains one candidate evidence object plus the fixed `search-relevance-noul-v1` rubric. The structured question explicitly refers to `query` and `candidate` by their actual field names. Packed questions are independent candidate-local judgments. A singleton request mode remains in the developer contract probe as the comparison oracle for packing experiments.
 
 ## Ranking and provenance
 
@@ -64,7 +66,7 @@ The synthetic connection test sends built-in arithmetic only. It is a protocol/p
 
 Every remote job is bound to an immutable `RerankLease`: session ID, Search epoch, query hash, filters hash, generation, embedding fingerprint, cloud/settings/consent/credential revisions, baseline/candidate windows, deadline, and AbortSignal. The view also keeps the exact query/filter/current-snapshot closure.
 
-Currentness and authorization are checked before planning/cache use, before queue entry/dispatch, synchronously immediately before the network write, after responses, before reduction/cache insertion, after final graph retrieval, and before publication. Editing, deleting, renaming, reindexing, changing filters/query/mode/settings/consent/provider/credential, closing a view, or unloading the plugin aborts and invalidates obsolete work.
+Currentness and authorization are checked before planning/cache use, before queue entry/dispatch, synchronously immediately before the network write, after responses, before reduction/cache insertion, after final graph retrieval, and before publication. A note-scoped edit/delete invalidation aborts only jobs whose candidate cohort contains that note; unrelated jobs and snapshot-bound cached judgments remain usable. Global query/mode/runtime/settings/consent/provider/credential changes still invalidate all affected work. If an already-published JEV view cannot restore its exact saved local baseline after a snapshot change, it clears immediately rather than leaving the stale reranked list visible.
 
 Remote work is outside the serialized local `runQueries()` lane. The plugin owns one global two-request semaphore; each view owns its active AbortController. Publication is atomic: only complete compatible judgments can replace the display. Partial cohorts never publish.
 
@@ -91,7 +93,7 @@ Operation metrics are content-free: retrieval windows, candidate/exhaustion coun
 
 ## Validation
 
-CI runs `npm ci`, `npm run typecheck`, `npm test`, `npm run eval:rerank`, and `npm run package`. The test matrix covers legacy retrieval projection, flat passage rank provenance, window replacement, policy vetoes, split settings/secrets, one/two-passage evidence, UTF-8/byte bounds, packed query-only state, deterministic cohort shrink, strict response parsing, dated OpenRouter serving provenance, max aggregation, score/cosine separation, cache invalidation, partial-batch failure, serving-identity drift, stale snapshot suppression, global concurrency, physical cancellation, deadlines, budget rejection, circuit breaking, and synthetic connection isolation.
+CI runs `npm ci`, `npm run typecheck`, `npm test`, `npm run eval:rerank`, and `npm run package`. The test matrix covers legacy retrieval projection, flat passage rank provenance, window replacement, policy vetoes, split settings/secrets, one/two-passage evidence, UTF-8/byte bounds, explicit structured-field references, packed query-only state, candidate-cohort parity across one/two-passage planning, strict response parsing, dated OpenRouter serving provenance, max aggregation, score/cosine separation, note-scoped versus global invalidation, stale-baseline clearing, partial-batch failure, serving-identity drift, stale snapshot suppression, global concurrency, physical cancellation, deadlines, budget rejection, circuit breaking, and synthetic connection isolation.
 
 The included evaluation corpus is intentionally synthetic and exists only to exercise metrics/reporting. It is not evidence that JEV improves the vault. A real release decision still requires the RFC's frozen-candidate and end-to-end human-reviewed evaluation, including current local, widened local, current-30+JEV, widened+JEV, one/two-passage, singleton/packed, language, chunking, latency, fallback, cost, and regression arms.
 

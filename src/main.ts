@@ -353,7 +353,7 @@ export default class LocalSemanticSearchPlugin extends Plugin {
   }
 
   private invalidateViews(noteId?: string): void {
-    this.reranker?.invalidate();
+    this.reranker?.invalidate(noteId);
     this.views().forEach(view => view.invalidate(noteId));
   }
 

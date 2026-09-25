@@ -26,6 +26,7 @@ export const LIMITS = Object.freeze({
   questions: 24,
   concurrency: 2,
   maxBatches: 3,
+  twoPassageMaxBatches: 5,
   queryBytes: 4096,
   evidenceBytes: 1536,
   requestBytes: 48_000,
@@ -33,6 +34,7 @@ export const LIMITS = Object.freeze({
   requestTargetTokens: 20_000,
   requestTokens: 24_000,
   operationTokens: 64_000,
+  twoPassageOperationTokens: 128_000,
   deadlineMs: 2500,
   cacheEntries: 5000,
   cacheBytes: 1_000_000,
@@ -40,6 +42,12 @@ export const LIMITS = Object.freeze({
   sessionRequests: 1000,
   sessionTokens: 2_000_000,
 });
+
+export function operationBudget(passagesPerNote: 1 | 2): { maxBatches: number; operationTokens: number } {
+  return passagesPerNote === 2
+    ? { maxBatches: LIMITS.twoPassageMaxBatches, operationTokens: LIMITS.twoPassageOperationTokens }
+    : { maxBatches: LIMITS.maxBatches, operationTokens: LIMITS.operationTokens };
+}
 
 export interface RerankSettings {
   enabled: boolean;
