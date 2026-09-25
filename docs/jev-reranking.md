@@ -37,7 +37,7 @@ Remote disclosure is independent of local indexing admission. A note must still 
 
 `planRerank()` plans a complete cohort before any network write. Candidate breadth is chosen once using the release one-passage policy: it attempts the available candidate count, then deterministic smaller cohorts (including 48, 40, 30 and the current display floor) until that complete plan fits. If the current displayed note count itself cannot fit, the rerank is bypassed.
 
-The two-passage experiment then reuses exactly that candidate cohort. It receives a larger bounded operation budget (up to five packed requests and 128k conservative estimated tokens across the operation, versus three / 64k for one passage). Each individual request remains under the existing 24k conservative estimate. If the exact cohort still cannot fit, the rerank is bypassed instead of shrinking to a different candidate set.
+The two-passage experiment then reuses exactly that candidate cohort. It receives a larger bounded operation budget (up to six packed requests and 128k conservative estimated tokens across the operation, versus three / 64k for one passage). Each individual request remains under the existing 24k conservative estimate. If the exact cohort still cannot fit, the rerank is bypassed instead of shrinking to a different candidate set.
 
 Planning uses both serialized-byte bounds and a conservative token estimate. The estimate is not presented as the JEV tokenizer. Provider-reported usage is retained separately in content-free operation metrics.
 

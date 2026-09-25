@@ -119,7 +119,7 @@ export function renderRerankSettings(
       })));
 
   root.createEl("p", {
-    text: "Limits: up to 60 admitted notes, 30 displayed notes, up to 24 independent candidate-local questions per packed request, two concurrent requests, a 2.5-second remote deadline, and no retries. One-passage planning uses at most 3 batches / 64k estimated tokens. The two-passage experiment uses at most 5 batches / 128k estimated tokens and must keep the same candidate cohort chosen by one-passage planning; otherwise the exact local ranking stays visible. Publication requires complete compatible judgments. The judgment cache is RAM-only with a 15-minute TTL.",
+    text: "Limits: up to 60 admitted notes, 30 displayed notes, up to 24 independent candidate-local questions per packed request, two concurrent requests, a 2.5-second remote deadline, and no retries. One-passage planning uses at most 3 batches / 64k estimated tokens. The two-passage experiment uses at most 6 batches / 128k estimated tokens and must keep the same candidate cohort chosen by one-passage planning; otherwise the exact local ranking stays visible. Publication requires complete compatible judgments. The judgment cache is RAM-only with a 15-minute TTL.",
     cls: "setting-item-description",
   });
 }

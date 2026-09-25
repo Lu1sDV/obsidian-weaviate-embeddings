@@ -26,7 +26,7 @@ export const LIMITS = Object.freeze({
   questions: 24,
   concurrency: 2,
   maxBatches: 3,
-  twoPassageMaxBatches: 5,
+  twoPassageMaxBatches: 6,
   queryBytes: 4096,
   evidenceBytes: 1536,
   requestBytes: 48_000,
