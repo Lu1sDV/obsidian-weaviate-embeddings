@@ -1,4 +1,5 @@
 import { defaultRerankSettings, type RerankSettings } from "./types";
+import { normalizeDecisionModelId } from "./model-catalog";
 
 function paths(value: unknown, folders: boolean): string[] {
   if (!Array.isArray(value) || value.length > 1000) throw new Error("Invalid remote exclusions");
@@ -14,11 +15,12 @@ function paths(value: unknown, folders: boolean): string[] {
 export function validateRerankSettings(raw: unknown): RerankSettings {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Invalid rerank settings");
   const value = { ...defaultRerankSettings(), ...raw } as Record<string, unknown>;
-  if (typeof value.enabled !== "boolean" || (value.provider !== "openrouter" && value.provider !== "typesafe")
+  if (typeof value.enabled !== "boolean" || value.provider !== "openrouter"
     || (value.evidencePassages !== 1 && value.evidencePassages !== 2)) throw new Error("Invalid rerank settings");
   return {
     enabled: value.enabled,
     provider: value.provider,
+    model: value.model === "" ? "" : normalizeDecisionModelId(value.model),
     evidencePassages: value.evidencePassages,
     excludedFolders: paths(value.excludedFolders, true),
     excludedFiles: paths(value.excludedFiles, false),

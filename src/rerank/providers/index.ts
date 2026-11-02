@@ -1,10 +1,9 @@
 import type { RemoteTransport } from "../remote-http";
-import type { Provider } from "../types";
+import type { ValidatedDecisionModel } from "../model-catalog";
 import { OpenRouterSystemOneProvider } from "./openrouter-systemone";
 import type { ProviderFactory, RerankProvider } from "./provider";
-import { TypeSafeSystemOneProvider } from "./typesafe-systemone";
 
-export const providerFor: ProviderFactory = (route: Provider, transport: RemoteTransport): RerankProvider =>
-  route === "openrouter" ? new OpenRouterSystemOneProvider(transport) : new TypeSafeSystemOneProvider(transport);
+export const providerFor: ProviderFactory = (model: ValidatedDecisionModel, transport: RemoteTransport): RerankProvider =>
+  new OpenRouterSystemOneProvider(model, transport);
 
 export type { ProviderFactory, RerankProvider } from "./provider";

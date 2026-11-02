@@ -1,14 +1,16 @@
 import { parseJudgments } from "../systemone";
-import { PROVIDERS } from "../types";
+import type { ValidatedDecisionModel } from "../model-catalog";
 import type { RemoteTransport } from "../remote-http";
 import type { RequestBatch } from "../systemone";
 import type { RerankProvider } from "./provider";
 
 export class OpenRouterSystemOneProvider implements RerankProvider {
   readonly route = "openrouter" as const;
-  readonly requestedModel = PROVIDERS.openrouter.model;
+  readonly requestedModel: string;
 
-  constructor(private readonly transport: RemoteTransport) {}
+  constructor(private readonly model: ValidatedDecisionModel, private readonly transport: RemoteTransport) {
+    this.requestedModel = model.requestedModel;
+  }
 
   async evaluate(batch: RequestBatch, apiKey: string, signal: AbortSignal, deadlineAt: number, beforeSend: () => void) {
     const text = await this.transport({
@@ -19,6 +21,6 @@ export class OpenRouterSystemOneProvider implements RerankProvider {
       deadlineAt,
       beforeSend,
     });
-    return parseJudgments(text, this.route, batch.records.map(record => record.key));
+    return parseJudgments(text, this.model, batch.records.map(record => record.key));
   }
 }

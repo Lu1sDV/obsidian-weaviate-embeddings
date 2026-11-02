@@ -5,14 +5,16 @@ import { planRerank } from "./planner";
 import { providerFor } from "./providers";
 import { rankNotes } from "./reduce";
 import { packRequests, sameServingIdentity } from "./systemone";
+import { DecisionModelError, type ValidatedDecisionModel } from "./model-catalog";
+import { OpenRouterModelRegistry, type ModelRegistry } from "./model-registry";
 import {
   EVIDENCE_POLICY_VERSION,
   LIMITS,
   operationBudget,
   PRIMITIVE_VERSION,
-  PROVIDERS,
   RANKING_POLICY_VERSION,
   RUBRIC_VERSION,
+  REASON_LABELS,
   RerankError,
   type EvidenceRecord,
   type Provider,
@@ -95,16 +97,22 @@ export class RerankService {
   private readonly queue = new RequestQueue();
   private readonly jobs = new Map<AbortController, ReadonlySet<string>>();
   private readonly resolved = new Map<Provider, ServingIdentity>();
-  private readonly failures = new Map<Provider, { count: number; until: number }>();
+  private readonly failures = new Map<string, { count: number; until: number }>();
   private requests = 0;
   private tokens = 0;
   private revision = 0;
   private disposed = false;
+  validationProblem: string | null = null;
 
   constructor(
     private readonly access: () => RerankAccess,
     private readonly transport: RemoteTransport = createRemoteTransport(),
+    private readonly models: ModelRegistry = new OpenRouterModelRegistry(),
   ) {}
+
+  get validatedModel(): ValidatedDecisionModel | null {
+    return this.models.current(this.access());
+  }
 
   invalidate(noteId?: string): void {
     if (noteId) {
@@ -130,6 +138,8 @@ export class RerankService {
 
   /** Explicit settings action. Built-in text only; never reads a vault candidate. */
   testConnection(signal: AbortSignal): Promise<RerankOutcome> {
+    this.invalidate();
+    this.validationProblem = null;
     return this.evaluate({
       vaultId: "synthetic",
       generation: 0,
@@ -150,13 +160,15 @@ export class RerankService {
 
   private async evaluate(original: RerankInput, synthetic: boolean): Promise<RerankOutcome> {
     const started = performance.now();
-    const deadlineAt = started + LIMITS.deadlineMs;
+    const timeout = synthetic ? 10_000 : LIMITS.deadlineMs;
+    const deadlineAt = started + timeout;
     const access = this.access();
+    const routeKey = hash([access.provider, access.model, access.apiKey]);
     const revision = this.revision;
     const input = { ...original, candidates: structuredClone(original.candidates) };
     const metrics: RerankMetrics = {
       route: access.provider,
-      requestedModel: PROVIDERS[access.provider].model,
+      requestedModel: access.model,
       metricVersion: `${RUBRIC_VERSION}/${EVIDENCE_POLICY_VERSION}/${RANKING_POLICY_VERSION}`,
       inputCandidateCount: input.candidates.length,
       candidateCount: 0,
@@ -195,12 +207,13 @@ export class RerankService {
     const cancel = () => job.abort(new RerankError("cancelled"));
     if (input.signal.aborted) cancel();
     else input.signal.addEventListener("abort", cancel, { once: true });
-    const timer = setTimeout(() => job.abort(new RerankError("deadline")), LIMITS.deadlineMs);
+    const timer = setTimeout(() => job.abort(new RerankError("deadline")), timeout);
     this.jobs.set(job, new Set(input.candidates.map(candidate => candidate.result.noteId)));
 
     const guard = () => {
       const currentAccess = this.access();
       if (this.disposed || revision !== this.revision || !input.isCurrent()
+        || currentAccess.model !== access.model || currentAccess.apiKey !== access.apiKey
         || currentAccess.revision !== access.revision
         || currentAccess.settingsRevision !== lease.settingsRevision
         || currentAccess.cloudPolicyRevision !== lease.cloudPolicyRevision
@@ -211,28 +224,31 @@ export class RerankService {
       }
       if (performance.now() >= lease.deadlineAt) throw new RerankError("deadline");
       if (!synthetic && !access.enabled) throw new RerankError("off");
-      if (!access.apiKey) throw new RerankError("unconfigured");
+      if (!access.apiKey || !access.model) throw new RerankError("unconfigured");
       if (!synthetic && (!access.consent || !input.candidates.every(input.isAllowed))) throw new RerankError("policy");
     };
 
     try {
       guard();
-      if ((this.failures.get(access.provider)?.until ?? 0) > performance.now()) throw new RerankError("circuit-open");
+      if ((this.failures.get(routeKey)?.until ?? 0) > performance.now()) throw new RerankError("circuit-open");
 
-      const provider = providerFor(access.provider, this.transport);
-      if (provider.requestedModel !== PROVIDERS[access.provider].model) throw new RerankError("model-change");
+      const model = synthetic ? await this.models.load(access, lease.signal) : this.models.current(access);
+      guard();
+      if (!model) throw new RerankError("model-unverified");
+      const provider = providerFor(model, this.transport);
+      if (provider.requestedModel !== access.model) throw new RerankError("model-change");
       const plan = planRerank(
         input.candidates,
         input.minimumCandidateCount,
         input.query,
-        access.provider,
+        model,
         synthetic ? 1 : access.evidencePassages,
       );
       metrics.candidateCount = plan.candidates.length;
       metrics.evidenceCount = plan.records.length;
       metrics.truncatedCount = plan.records.filter(record => record.truncated).length;
 
-      const known = this.resolved.get(access.provider);
+      const known = synthetic ? undefined : this.resolved.get(access.provider);
       const key = (record: EvidenceRecord, serving: ServingIdentity) => hash([
         input.vaultId,
         serving.route,
@@ -270,7 +286,7 @@ export class RerankService {
 
       // The full cohort was admitted by planRerank before cache use. Repack only current misses.
       const missing = plan.records.filter(record => !scores.has(record.key));
-      const batches = packRequests(access.provider, input.query, missing);
+      const batches = packRequests(model, input.query, missing);
       metrics.estimatedTokens = batches.reduce((sum, batch) => sum + batch.estimatedTokens, 0);
       const operation = operationBudget(synthetic ? 1 : access.evidencePassages);
       if (batches.length > operation.maxBatches || metrics.estimatedTokens > operation.operationTokens) {
@@ -283,6 +299,8 @@ export class RerankService {
 
       let serving = scores.size ? known : undefined;
       let next = 0;
+      let pricedResponses = 0;
+      let reportedCost = 0;
       const worker = async () => {
         while (next < batches.length) {
           const batch = batches[next++]!;
@@ -294,11 +312,13 @@ export class RerankService {
             this.requests++;
             this.tokens += batch.estimatedTokens;
             metrics.requests++;
+            metrics.cost = null;
 
             const response = await provider.evaluate(batch, access.apiKey, lease.signal, lease.deadlineAt, guard);
             metrics.inputTokens += response.inputTokens;
             metrics.outputTokens += response.outputTokens;
-            metrics.cost += response.cost ?? 0;
+            if (response.cost !== undefined) { reportedCost += response.cost; pricedResponses++; }
+            metrics.cost = pricedResponses === metrics.requests ? reportedCost : null;
             this.tokens += Math.max(0, response.inputTokens - batch.estimatedTokens);
             guard();
 
@@ -331,13 +351,21 @@ export class RerankService {
       if (!synthetic) {
         this.resolved.set(access.provider, serving);
         for (const record of plan.records) this.cache.set(key(record, serving), scores.get(record.key)!);
+      } else {
+        // A successful catalogue lookup is insufficient. Only a complete validated inference
+        // response with our actual state and Noul shape enables this model/key combination.
+        this.models.approve(access, model);
+        this.resolved.delete(access.provider);
+        this.cache.clear();
       }
       metrics.servedModel = serving.servedModel;
       if (serving.upstreamProvider !== undefined) metrics.upstreamProvider = serving.upstreamProvider;
-      this.failures.delete(access.provider);
+      this.failures.delete(routeKey);
       return { status: "applied", results, metrics };
     } catch (problem) {
-      const error = problem instanceof RerankError ? problem : new RerankError("provider");
+      const error = problem instanceof RerankError ? problem
+        : new RerankError(problem instanceof DecisionModelError ? "model-invalid" : "provider");
+      if (synthetic) this.validationProblem = problem instanceof DecisionModelError ? problem.message : REASON_LABELS[error.reason];
       job.abort(error);
 
       if (error.reason === "model-change") {
@@ -345,10 +373,10 @@ export class RerankService {
         this.resolved.delete(access.provider);
       }
       if (error.reason === "rate-limit") {
-        this.failures.set(access.provider, { count: 3, until: performance.now() + 30_000 });
+        this.failures.set(routeKey, { count: 3, until: performance.now() + 30_000 });
       } else if (error.transient || (error.reason === "deadline" && metrics.requests > 0)) {
-        const count = (this.failures.get(access.provider)?.count ?? 0) + 1;
-        this.failures.set(access.provider, {
+        const count = (this.failures.get(routeKey)?.count ?? 0) + 1;
+        this.failures.set(routeKey, {
           count,
           until: count >= 3 ? performance.now() + 30_000 : 0,
         });

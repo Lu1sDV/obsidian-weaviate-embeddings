@@ -45,6 +45,8 @@ export class SemanticSearchView extends ItemView {
   private context: QueryContext | undefined;
   private requestEpoch = 0;
   private searchTimer: number | undefined;
+  private indexRefreshPending = false;
+  private indexRefreshTimer: number | undefined;
   private queryActive = false;
   private activeQueryEpoch: number | undefined;
   private queryPending = false;
@@ -61,6 +63,8 @@ export class SemanticSearchView extends ItemView {
   private reranked = false;
   private interactionEpoch = 0;
   private rerankButton!: HTMLButtonElement;
+  private rerankEnabledButton!: HTMLButtonElement;
+  private changingRerankEnabled = false;
   private applyRerankButton!: HTMLButtonElement;
   private rerankStatus!: HTMLElement;
   private readonly passageRequests = new Map<string, Promise<SearchResult["passages"]>>();
@@ -163,7 +167,10 @@ export class SemanticSearchView extends ItemView {
     this.updateReference();
     for (const controls of this.filterControls.values()) controls.updateFields();
     this.needsRefresh = true;
-    if (this.state.servingReady && !this.queryPending && this.searchTimer === undefined) this.requestRefresh();
+    if (this.state.servingReady && !this.queryPending && this.searchTimer === undefined) {
+      this.indexRefreshPending = true;
+      this.scheduleIndexRefresh();
+    }
   }
 
   setEdgeCutoff(cutoff: number): void {
@@ -214,9 +221,11 @@ export class SemanticSearchView extends ItemView {
           // Cancel publication now, not when the debounce expires.
           this.requestRefresh(250);
         });
-        this.rerankButton = controls.createEl("button", { text: "Rerank with JEV", attr: { "aria-label": "Rerank Search with the configured cloud provider" } });
+        this.rerankEnabledButton = controls.createEl("button", { attr: { "aria-label": "Enable manual reranking", "aria-pressed": "false" } });
+        this.rerankEnabledButton.addEventListener("click", () => void this.toggleReranking());
+        this.rerankButton = controls.createEl("button", { text: "Rerank with System One", attr: { "aria-label": "Rerank Search with the configured OpenRouter model" } });
         this.rerankButton.addEventListener("click", () => void this.rerankSearch());
-        this.applyRerankButton = controls.createEl("button", { text: "Apply JEV ranking" });
+        this.applyRerankButton = controls.createEl("button", { text: "Apply reranked order" });
         this.applyRerankButton.hidden = true;
         this.applyRerankButton.addEventListener("click", () => this.applyPendingRanking());
         this.rerankStatus = panel.createDiv({ cls: "local-semantic-muted", attr: { role: "status" } });
@@ -437,8 +446,27 @@ export class SemanticSearchView extends ItemView {
     return { updateFields, updatePresets, updateChips };
   }
 
+  /** Keep a current manual ranking stable while unrelated notes finish indexing. */
+  private retainsRerankSnapshot(): boolean {
+    return this.mode === "search" && !!this.searchSeed && this.displayCurrent(this.searchSeed.context)
+      && (!!this.rerankJob || !!this.pendingRanking || this.reranked);
+  }
+
+  private scheduleIndexRefresh(): void {
+    if (this.closed || this.queryActive || !this.indexRefreshPending || this.indexRefreshTimer !== undefined || this.retainsRerankSnapshot()) return;
+    this.indexRefreshTimer = window.setTimeout(() => {
+      this.indexRefreshTimer = undefined;
+      if (this.closed || !this.ready() || !this.indexRefreshPending || this.queryActive || this.retainsRerankSnapshot()) return;
+      this.indexRefreshPending = false;
+      this.requestRefresh();
+    }, 250);
+  }
+
   private cancelRequests(): void {
     this.cancelRerank();
+    window.clearTimeout(this.indexRefreshTimer);
+    this.indexRefreshTimer = undefined;
+    this.indexRefreshPending = false;
     this.searchSeed = undefined;
     this.reranked = false;
     this.updateRerankControls();
@@ -487,7 +515,11 @@ export class SemanticSearchView extends ItemView {
         this.activeQueryEpoch = this.requestEpoch;
         await this.refresh(this.activeQueryEpoch);
       }
-    } finally { this.queryActive = false; this.activeQueryEpoch = undefined; }
+    } finally {
+      this.queryActive = false;
+      this.activeQueryEpoch = undefined;
+      this.scheduleIndexRefresh();
+    }
   }
 
   private ready(): boolean { return !this.closed && this.state.indexingEnabled && this.state.servingReady && !this.state.schemaUpdating; }
@@ -628,6 +660,7 @@ export class SemanticSearchView extends ItemView {
     if (this.reranked && this.searchSeed) this.publishRanking(this.searchSeed.baseline, this.searchSeed.graph, this.searchSeed.graphFailed, false);
     this.rerankStatus?.setText("Local results retained — remote settings changed");
     this.updateRerankControls();
+    this.scheduleIndexRefresh();
   }
 
   private cancelRerank(): void {
@@ -641,9 +674,42 @@ export class SemanticSearchView extends ItemView {
   private updateRerankControls(): void {
     if (!this.rerankButton) return;
     const access = this.rerankStore?.access();
-    this.rerankButton.setText(this.pendingRanking ? "Keep local ranking" : this.reranked ? "Use local ranking" : "Rerank with JEV");
-    this.rerankButton.disabled = !this.searchSeed || !!this.rerankJob || (!this.pendingRanking && !this.reranked && !access?.enabled);
-    this.rerankButton.title = access?.enabled ? "Query text and bounded, permitted excerpts will be sent to the configured provider" : "Enable optional JEV reranking in plugin settings first";
+    if (this.rerankEnabledButton) {
+      this.rerankEnabledButton.setText(access?.enabled ? "Reranking on" : "Reranking off");
+      this.rerankEnabledButton.setAttribute("aria-pressed", String(access?.enabled === true));
+      this.rerankEnabledButton.setAttribute("aria-label", access?.enabled ? "Disable manual reranking" : "Enable manual reranking");
+      this.rerankEnabledButton.disabled = !this.rerankStore || this.changingRerankEnabled;
+      this.rerankEnabledButton.title = "Enable or disable manual reranking. Enabling does not send a request; use Rerank to run it.";
+    }
+    const label = this.rerankJob ? "Cancel reranking" : this.pendingRanking ? "Keep local ranking" : this.reranked ? "Use local ranking" : "Rerank with System One";
+    this.rerankButton.setText(label);
+    this.rerankButton.setAttribute("aria-label", label);
+    this.rerankButton.disabled = !this.rerankJob && (!this.searchSeed || (!this.pendingRanking && !this.reranked && !access?.enabled));
+    this.rerankButton.title = this.rerankJob ? "Cancel the pending request and keep local results"
+      : this.pendingRanking || this.reranked ? "Keep the original local ranking"
+      : !access?.enabled ? "Turn reranking on here, then configure its model, key, and upload permission in plugin settings"
+      : !this.reranker?.validatedModel ? "Validate the selected OpenRouter model in plugin settings before reranking"
+      : "Query text and permitted excerpts will be sent to the configured OpenRouter model";
+  }
+
+  private async toggleReranking(): Promise<void> {
+    if (!this.rerankStore || this.changingRerankEnabled) return;
+    this.changingRerankEnabled = true;
+    this.updateRerankControls();
+    try {
+      await this.rerankStore.configure({ enabled: !this.rerankStore.access().enabled });
+      if (this.closed) return;
+      const access = this.rerankStore.access();
+      this.rerankStatus.setText(!access.enabled ? "Reranking off — local results retained"
+        : !access.apiKey || !access.consent ? "Reranking on — configure the model, key, and upload permission in plugin settings"
+        : !this.reranker?.validatedModel ? "Reranking on — validate the selected OpenRouter model in plugin settings"
+        : "Reranking on — use Rerank to run it");
+    } catch {
+      if (!this.closed) this.rerankStatus.setText("Could not save reranking preference. Review plugin settings.");
+    } finally {
+      this.changingRerankEnabled = false;
+      this.updateRerankControls();
+    }
   }
 
   private remoteAllowed(result: SearchResult, context: QueryContext): boolean {
@@ -654,19 +720,31 @@ export class SemanticSearchView extends ItemView {
 
   /** Deliberately outside runQueries(): obsolete cloud work cannot block a new local query. */
   private async rerankSearch(): Promise<void> {
+    if (this.rerankJob) {
+      this.cancelRerank();
+      this.updateRerankControls();
+      this.rerankStatus.setText("Reranking cancelled — local results retained");
+      this.scheduleIndexRefresh();
+      return;
+    }
     const seed = this.searchSeed;
     if (!seed || !this.reranker || !this.rerankStore || !this.displayCurrent(seed.context)) return;
     if (this.pendingRanking) {
-      this.cancelRerank(); this.updateRerankControls(); this.rerankStatus.setText("Local hybrid results"); return;
+      this.cancelRerank(); this.updateRerankControls(); this.rerankStatus.setText("Local hybrid results");
+      this.scheduleIndexRefresh(); return;
     }
     if (this.reranked) {
       this.publishRanking(seed.baseline, seed.graph, seed.graphFailed, false);
-      this.rerankStatus.setText("Local hybrid results"); return;
+      this.rerankStatus.setText("Local hybrid results");
+      this.scheduleIndexRefresh(); return;
     }
-    if (this.rerankJob) return;
     const access = this.rerankStore.access();
     const unavailable = !access.enabled ? "off" : !access.apiKey ? "unconfigured" : !access.consent ? "policy" : undefined;
     if (unavailable) { this.rerankStatus.setText(`Local results retained — ${REASON_LABELS[unavailable]}`); return; }
+    if (!this.reranker.validatedModel) {
+      this.rerankStatus.setText("Local results retained — validate the selected OpenRouter model in plugin settings");
+      return;
+    }
     const job = new AbortController();
     this.rerankJob = job;
     this.rerankCandidates = seed.window.notes;
@@ -676,7 +754,7 @@ export class SemanticSearchView extends ItemView {
       && this.rerankStore!.access().revision === access.revision
       && seed.baseline.every(result => this.resultCurrent(result, seed.context));
     this.updateRerankControls();
-    this.rerankStatus.setText("Preparing bounded JEV evidence; local results remain available…");
+    this.rerankStatus.setText("Preparing reranking evidence; local results remain available…");
     try {
       const expansion = await this.searchRetrieval.expand(seed.window, {
         generation: seed.context.generation,
@@ -690,7 +768,7 @@ export class SemanticSearchView extends ItemView {
       this.rerankCandidates = pool;
       const snapshotsCurrent = () => current() && pool.every(candidate => this.resultCurrent(candidate.result, seed.context));
       const allowed = () => snapshotsCurrent() && pool.every(candidate => this.remoteAllowed(candidate.result, seed.context));
-      this.rerankStatus.setText("Reranking with JEV; local results remain available…");
+      this.rerankStatus.setText("Reranking with System One; local results remain available…");
       const outcome = await this.reranker.run({
         vaultId: this.state.vaultId,
         generation: seed.context.generation,
@@ -723,12 +801,16 @@ export class SemanticSearchView extends ItemView {
       this.pendingRanking = { results: outcome.results, graph, graphFailed, metrics: outcome.metrics, current: allowed };
       if (interaction !== this.interactionEpoch || this.scrollEl.contains(this.contentEl.ownerDocument.activeElement)) {
         this.applyRerankButton.hidden = false;
-        this.rerankStatus.setText("JEV ranking ready — apply when you have finished inspecting local results");
+        this.rerankStatus.setText("Reranked order ready — apply when you have finished inspecting local results");
       } else this.applyPendingRanking();
     } catch {
       if (current()) this.rerankStatus.setText("Local results retained — reranking could not be completed");
     } finally {
-      if (this.rerankJob === job) { this.rerankJob = undefined; this.updateRerankControls(); }
+      if (this.rerankJob === job) {
+        this.rerankJob = undefined;
+        this.updateRerankControls();
+        this.scheduleIndexRefresh();
+      }
     }
   }
 
@@ -737,13 +819,14 @@ export class SemanticSearchView extends ItemView {
     if (!pending) return;
     if (!pending.current()) {
       this.cancelRerank(); this.updateRerankControls();
-      this.rerankStatus.setText("Local results retained — candidate snapshots or permissions changed"); return;
+      this.rerankStatus.setText("Local results retained — candidate snapshots or permissions changed");
+      this.scheduleIndexRefresh(); return;
     }
     this.pendingRanking = undefined;
     this.applyRerankButton.hidden = true;
     this.publishRanking(pending.results, pending.graph, pending.graphFailed, true);
     const metrics = pending.metrics;
-    this.rerankStatus.setText(`JEV relevance · ${metrics.servedModel ?? metrics.requestedModel} · ${metrics.evidenceCount} passages · ${metrics.cacheHits} cached${metrics.truncatedCount ? ` · ${metrics.truncatedCount} bounded excerpts` : ""}`);
+    this.rerankStatus.setText(`System One relevance · ${metrics.servedModel ?? metrics.requestedModel} · ${metrics.evidenceCount} passages · ${metrics.cacheHits} cached${metrics.truncatedCount ? ` · ${metrics.truncatedCount} bounded excerpts` : ""}`);
   }
 
   private publishRanking(results: readonly SearchResult[], graph: SimilarityGraphData | undefined, graphFailed: boolean, reranked: boolean): boolean {
@@ -757,7 +840,7 @@ export class SemanticSearchView extends ItemView {
     this.inspectorEl.replaceChildren(); this.inspectorEl.hidden = true;
     this.resultStatusEl.replaceChildren();
     this.resultStatusEl.createEl("strong", { text: `${results.length} notes`, cls: "local-semantic-result-count" });
-    this.resultStatusEl.createEl("strong", { text: reranked ? "JEV reranked search" : "Hybrid search", cls: "local-semantic-result-mode" });
+    this.resultStatusEl.createEl("strong", { text: reranked ? "Reranked search" : "Hybrid search", cls: "local-semantic-result-mode" });
     if (!reranked && seed.exhausted) this.resultStatusEl.createDiv({ text: "Candidate limit reached; additional admitted matches may exist.", cls: "local-semantic-result-warning" });
     if (graph) this.graph.setData(graph); else this.graph.clear();
     if (graphFailed) this.resultStatusEl.createDiv({ text: "Graph unavailable: stored vectors could not be validated.", cls: "local-semantic-result-warning" });
@@ -781,7 +864,7 @@ export class SemanticSearchView extends ItemView {
       title.addEventListener("auxclick", (event) => { if (event.button === 1) void this.openResult(result, context, event); });
       article.createDiv({ text: result.path, cls: "local-semantic-result-path" });
       article.createDiv({ text: result.scoreKind === "similarity" ? `${context.targetPassageId ? "Passage" : "Note"} cosine ${result.score.toFixed(6)}` : `Hybrid rank score ${result.score.toFixed(6)}`, cls: "local-semantic-score" });
-      if (result.rerank) article.createDiv({ text: `JEV relevance ${result.rerank.relevance.toFixed(6)}`, cls: "local-semantic-score",
+      if (result.rerank) article.createDiv({ text: `System One relevance ${result.rerank.relevance.toFixed(6)}`, cls: "local-semantic-score",
         attr: { title: `${result.rerank.route} · ${result.rerank.servedModel} · ${result.rerank.rubricVersion} · ${result.rerank.evidencePolicyVersion} · ${result.rerank.rankingPolicyVersion}` } });
       const passages = article.createDiv({ cls: "local-semantic-passages" });
       passages.hidden = true;

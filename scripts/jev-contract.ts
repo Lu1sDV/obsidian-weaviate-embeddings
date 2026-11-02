@@ -1,14 +1,21 @@
 import { selectEvidence } from "../src/rerank/evidence";
 import { createRemoteTransport } from "../src/rerank/remote-http";
 import { parseJudgments, requestBatch } from "../src/rerank/systemone";
-import { LIMITS, RerankError, type EvidenceRecord } from "../src/rerank/types";
+import { OpenRouterModelRegistry } from "../src/rerank/model-registry";
+import { defaultRerankSettings, LIMITS, RerankError, type EvidenceRecord, type RerankAccess } from "../src/rerank/types";
 import type { RetrievedNoteCandidate } from "../src/weaviate";
 
 /** Explicit developer command. Inputs are built-in synthetic text, never a file or current vault. */
 async function main(): Promise<void> {
-  const provider = process.env.JEV_PROVIDER;
-  const apiKey = process.env.JEV_API_KEY;
-  if ((provider !== "openrouter" && provider !== "typesafe") || !apiKey) throw new RerankError("unconfigured");
+  const provider = "openrouter";
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  const modelId = process.env.OPENROUTER_MODEL;
+  if (!apiKey || !modelId) throw new RerankError("unconfigured");
+  const access: RerankAccess = {
+    ...defaultRerankSettings(), model: modelId.trim(), apiKey, consent: false,
+    revision: 0, modelRevision: 0, settingsRevision: 0, cloudPolicyRevision: 0, consentRevision: 0, credentialRevision: 0,
+  };
+  const model = await new OpenRouterModelRegistry().load(access, new AbortController().signal);
 
   const query = "Why must a reranker keep relevance separate from graph cosine?";
   const bodies = [
@@ -56,7 +63,7 @@ async function main(): Promise<void> {
   let upstreamProvider: string | undefined;
 
   const call = async (items: EvidenceRecord[], mode: "singleton" | "packed") => {
-    const request = requestBatch(provider, query, items, mode);
+    const request = requestBatch(model, query, items, mode);
     estimatedTokens += request.estimatedTokens;
     if (estimatedTokens > LIMITS.operationTokens) throw new RerankError("budget");
     const started = performance.now();
@@ -70,7 +77,7 @@ async function main(): Promise<void> {
         if (performance.now() >= deadlineAt) throw new RerankError("deadline");
       },
     });
-    const parsed = parseJudgments(wire, provider, items.map(item => item.key));
+    const parsed = parseJudgments(wire, model, items.map(item => item.key));
     if (servedModel && servedModel !== parsed.servingIdentity.servedModel) throw new RerankError("model-change");
     if (upstreamProvider && upstreamProvider !== parsed.servingIdentity.upstreamProvider) throw new RerankError("model-change");
     servedModel = parsed.servingIdentity.servedModel;
@@ -96,6 +103,7 @@ async function main(): Promise<void> {
 
   console.log(JSON.stringify({
     provider,
+    requestedModel: model.requestedModel,
     servedModel,
     upstreamProvider,
     inputTokens,
