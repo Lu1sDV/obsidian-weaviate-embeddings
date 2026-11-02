@@ -41,53 +41,113 @@ Keep these values separate:
 | Graph-edge cosine | Candidate-to-candidate note similarity in Search; not query similarity |
 | Reranker relevance | Model judgment under a versioned relevance rubric |
 
-Never relabel a hybrid score as cosine or overwrite cosine with relevance. Send source-to-candidate cosine only under an explicit field, retain it for display, and evaluate whether exposing it to the judge merely reinforces the first-stage ranking. An all-pairs graph matrix is a separate, quadratic input. See [`weaviate.ts`](../src/weaviate.ts), [`graph.ts`](../src/graph.ts), and [`types.ts`](../src/types.ts).
+Cosine is used for local candidate retrieval and remains visible in the results. **Do not include cosine values or retrieval ranks in the judge's input, and do not blend them with reranker relevance.** Sort by the returned relevance; exact ties retain stable input order. Hybrid score, source cosine and graph-edge cosine keep their separate labels. See [`weaviate.ts`](../src/weaviate.ts), [`graph.ts`](../src/graph.ts), and [`types.ts`](../src/types.ts).
 
-## Proposed evidence modes
+## Decisions clarified on 2026-11-02
 
-**Recommendation: preserve the complete source target in both modes; shorten candidate notes only.** A passage target means exactly that selected passage. A note target means the complete canonical indexed note, with the existing frontmatter policy.
+- One reranking API request per user action. If the payload is too large, shorten evidence locally or reduce the candidate prefix before dispatch. No overflow batches or automatic second inference attempt.
+- Ranking uses model relevance alone; original cosine remains visible and stays outside model input.
+- Oversized whole notes may lose context deliberately. Prefer substantive beginning/end material and relevant or representative interior windows, with visible shortening information.
+- Passage targets use the selected/matched chunk and its surrounding context.
+- Remove image destinations/embeds from outbound text while preserving useful textual descriptions where available.
+- Context should be larger than the earlier 256-token suggestion and may adapt to available request space. Numerical defaults below remain recommendations to evaluate.
 
-### Full candidate notes
+## Recommended evidence policies
 
-Retrieve a ranked candidate pool, hydrate verified complete notes, and admit the largest leading prefix that fits the chosen model and operation limits. Do not silently skip an oversized high-ranked candidate to admit shorter lower-ranked notes.
+**Adaptive context should be the default.** Send complete cleaned text when it fits; otherwise select extracts locally. Keep an optional **Complete text only** policy for cases where omission is unacceptable. Both policies use one request. The scope of the source (whole note or selected passage) is independent of the evidence policy.
 
-If the source alone cannot fit, keep local results and offer a passage target or another model. If one source/candidate pair cannot fit, stop the full-note prefix there and report the effective K; offer excerpt mode. If no candidate fits, send nothing. Multiple requests can extend the prefix when the judging design allows them.
+In Complete text only, reduce the leading candidate prefix until source, candidates and request structure fit. If even one complete comparison does not fit, retain local results and explain the limitation. Do not silently switch to excerpts.
 
-### Candidate excerpts
+In Adaptive context, preserve candidate breadth until meaningful evidence no longer fits, then reduce K from the tail and replan. Do not skip long high-ranked notes merely to admit smaller lower-ranked notes. A minimum token allowance is a planning heuristic, not a guarantee that an excerpt is informative.
 
-For each candidate:
+### Whole-note source
 
-1. Include its first substantive paragraph when it fits `introTokens`; otherwise use the first `introTokens` of canonical content.
-2. Preserve matched chunks and add up to `contextTokens` **before and after each chunk**. This proposed setting is per side, not a total shared allowance.
-3. Merge overlapping ranges, deduplicate the introduction, restore source order, and mark gaps. Include headings where useful.
-4. Enforce a total per-note budget. Prioritize strongest complete matches, then introduction/context; disclose omitted anchors and shortened spans. If the strongest match cannot fit, report the limitation instead of disguising an arbitrary prefix as complete evidence.
+Preserve the full source when affordable alongside useful evidence for the candidates. Otherwise select a common source excerpt containing the title, substantive introduction/conclusion and representative interior sections. Freeze that source representation before judging candidates: every question must use the same source.
 
-The whole-note Connections query currently returns note-level hits without matched passages. It therefore needs additional passage retrieval inside each candidate before “surrounding our chunks” has a defined meaning. Selected-passage Connections also needs grouped evidence: its current display deduplicates flat hits to the first passage per note.
+Candidate-specific excerpts must not redefine the source. Selecting all source content solely because it resembles the first-stage hits could erase other topics the whole-note search is intended to cover. Prefer source anchors when reliable retrieval provenance exists and otherwise cover distinct headings/sections. A literal middle window is a fallback for unstructured notes, not the meaning of “central.”
 
-## Context accounting and maximum K
+### Whole-note candidates
 
-For a joint request, define:
+For an oversized candidate, allocate most text to relevant interior matches with surrounding context, plus smaller opening and ending extracts. Use complete short notes whenever possible.
 
-`Kfit = max k ≤ Krequested such that tokens(serialize(source, candidates[0:k], questions, metadata)) + outputReserve + margin ≤ effectiveContext`.
+“Beginning” means substantive introductory content, after frontmatter, banners or a table of contents. “End” means substantive final material, not automatically a bibliography or attachment list. Such sections remain eligible when they contain the relevant match.
 
-Count all serialized fields, escaping/framing, repeated source text, rubrics, headings, and score metadata. Effective capacity must respect applicable model, serving-provider, input, output, transport, and full-text limits. A catalogue context size is not proof that a provider processes every submitted token.
+The whole-note Connections query currently returns note-level hits without matched passages. It therefore needs a local passage-evidence retrieval step inside each candidate. Selected-passage Connections likewise needs grouped evidence instead of its current strongest-per-note display projection.
 
-There is currently **no validated exact tokenizer/accounting path for every supported model**. Existing estimates and byte caps remain guards, not an exact maximum-K guarantee. Use a supported tokenizer/preflight counter when established; otherwise label planning estimates and keep conservative margins.
+### Passage targets and evidence
 
-For example, OpenRouter documents that **Clef and Clef Flash silently drop state text after roughly 2,000 tokens**, despite larger advertised contexts. They cannot support a claim of full-note coverage beyond that boundary. Jev's larger-context processing also has documented accuracy/latency tradeoffs. See [multimodal limits](https://openrouter.ai/docs/guides/community/multimodal-decisions#limits) and the [Jev guide](https://openrouter.ai/docs/guides/community/jev).
+Prioritize the complete selected source passage, then nearby context under its heading. Mark the selected passage separately from contextual text. If even the selected source passage cannot fit, ask the user to narrow that selection instead of silently substituting another target.
 
-## Independent judgments or a joint list?
+For candidate evidence, prioritize the matched chunk and grow the surrounding window. The note's opening/ending should not consume this budget unless relevant. An oversized candidate chunk may be shortened to a relevant internal span in Adaptive context; mark that explicitly.
 
-**Recommend independent Noul judgments per candidate**, sharing the complete source and fixed rubric. This preserves stable candidate evidence across batches and fits the current architecture. Each batch must fit; total K is then also bounded by cost, request count, and elapsed time. Equivalent singleton/packed behavior still needs measurement.
+### Extract construction
 
-A joint list exposes every candidate and cosine to every judgment. In that design the formula above bounds the entire list; splitting it changes comparison context and requires a separate strategy for comparable scores. These approaches are not interchangeable, and Noul is a probability of satisfying a condition, not a calibrated cosine or universal relevance scale.
+1. Parse Markdown structure and remove image payloads/destinations before token planning.
+2. Identify protected anchors and substantive boundary paragraphs.
+3. Allocate the strongest distinct matching or representative windows first; expand into neighboring paragraphs while budget remains.
+4. Merge overlaps, deduplicate reused introductory/final text, and restore original source order.
+5. Retain heading ancestry, essential table headers, list parents and quotation boundaries. Prefer paragraph/sentence cuts; preserve Unicode and label unavoidable cuts.
+6. Mark omitted ranges. Do not present concatenated disjoint text as an uninterrupted quotation.
 
-The existing 2.5-second remote deadline is unsuitable as an unmeasured promise for larger-note workloads. Before enabling either mode, measure completion coverage, latency, cost, and ranking quality; then select a bounded, cancellable latency policy. Preserve atomic publication and the local fallback.
+Selection priority and presentation order are different. An interior match may receive most of the budget but still appears after the introduction in the payload.
 
-## Proposed controls and three decisions
+## Markdown and image handling
 
-Expose source scope, Full notes / Excerpts, requested K, `introTokens`, and `contextTokens`, alongside on/off, manual Rerank, Cancel, and Use local ranking. Show requested/retrieved/actually judged/displayed counts separately, effective K, omitted candidates, truncated spans, estimated budget, reported usage, and served model. Never present the current 30-note display cap as the number judged.
+Use a structure-aware projection, not a broad regular expression over raw Markdown.
 
-1. **Should excerpt mode truncate candidates only, keeping the entire source note/passage intact?** Recommended: yes.
-2. **Should each candidate be judged independently against the source, or should the model compare one joint list of candidates and cosines?** Recommended: independent judgments, with measured batching equivalence.
-3. **For note-to-note relevance, should the judge favor useful related material, including complementary/contradictory notes, or mainly notes closely covering the same topic?** Recommended: useful related material, with a distinct rubric from question-answer retrieval.
+- Remove actual Markdown image destinations, reference-image definitions no longer used, Obsidian image embeds and HTML image targets. Retain meaningful alt text/captions; omit generic filenames, dimensions and base64/data payloads.
+- Preserve image-looking syntax inside code or escaped Markdown as literal note content.
+- Ordinary links/wikilinks may retain readable labels; no destination fetching is required. Do not indiscriminately delete ordinary URLs that are themselves relevant information.
+- Do not expand note transclusions, linked notes, attachments, OCR or remote media. A retained reference label must not imply the referenced content was read.
+- Leave stored notes, embedding text and index generations unchanged. This projection is for outbound reranking evidence; keep provenance back to the indexed source spans.
+
+## One request and a model-aware total budget
+
+Let B be the smaller of the user's total request cap and a conservative usable model limit. Reserve instructions, question framing, applicable output/framing allowance and safety headroom. Check both per-request and per-question limits where applicable.
+
+Budget the exact proposed payload, including all question rubrics and serialized structure. With an established tokenizer/accounting contract, enforce the token cap directly. Without one, display an estimate and retain conservative byte/provider guards; do not promise exact maximum-fitting K or universal full-text coverage.
+
+OpenRouter documents that **Clef and Clef Flash silently drop state text after roughly 2,000 tokens**, despite larger advertised contexts. Jev also has distinct long-context behavior. See [provider limits](https://openrouter.ai/docs/guides/community/multimodal-decisions#limits), the [Jev guide](https://openrouter.ai/docs/guides/community/jev), and [TypeSafe context limits](https://docs.typesafe.ai/models).
+
+### Allocation procedure
+
+1. Start with the desired candidate prefix in local retrieval order.
+2. Protect a useful evidence minimum per candidate and enough source context to define the task.
+3. Preserve the entire source if it fits alongside those minimums; otherwise construct the common source excerpt.
+4. Allocate remaining capacity approximately evenly across candidates, returning unused allocations from short notes to the pool. Do not give higher-cosine candidates systematically more text.
+5. Expand context toward complete content where possible. Reduce optional surroundings before losing strong anchors or coherent source coverage.
+6. If useful comparisons still do not fit, reduce K from the tail and recompute allocations locally.
+7. Serialize, verify limits, and dispatch once. An API rejection/failure retains the local ranking; it does not trigger a hidden smaller request.
+
+Dynamic context depends on the usable model limit, user cap, source length, candidate count and actual note lengths. Model context alone is insufficient. Multiple anchors must share a total per-candidate budget so per-side settings cannot multiply request size unexpectedly.
+
+### Proposed initial defaults, not measured optimums
+
+| Setting | Recommendation |
+| --- | --- |
+| Context allocation | Auto |
+| Total request cap | 64,000 tokens, further reduced by model/provider limits and headroom |
+| Desired candidates | 30; larger user values remain bounded by the same single-request budget |
+| Preferred surrounding context | 512 tokens per side, up from the earlier 256 suggestion |
+| Auto expansion ceiling | 2,048 tokens per side, still sharing the per-candidate and total budgets |
+| Candidate evidence floor | About 512 tokens when the note is long enough, adjusted for a useful anchor |
+| Preferred whole-note evidence | About 2,000 tokens per candidate; complete short notes use less |
+| Oversized source starting allocation | About 20–25% of available evidence space; redistribute according to actual lengths |
+
+Opening/end/interior ratios are flexible. As a starting policy for an oversized candidate, spend roughly 15% on the beginning, 15% on the ending and 70% on relevant interior evidence. Overlap and short/missing sections return space to other useful spans. Source notes require section coverage rather than mechanically applying candidate relevance selection.
+
+## Independent judgments in a single request
+
+Recommend **one shared source plus one independent Noul question per candidate, all inside the same API request**. Independent judging does not require separate network requests. Each candidate's evidence is attached to its question; cosine/rank are excluded from the payload. Use a fixed rubric for useful related material, including complementary evidence or substantive contradictions, rather than only duplicate subject coverage.
+
+A joint comparative list remains a different design: adding/removing a candidate can change the context for every judgment. It is unnecessary for the clarified single-request requirement. No additional summarization model call is needed; extraction is local and uses original text.
+
+Cache reuse must bind the exact cleaned/shortened source, candidate evidence, model, rubric and policy. Changing K or budget may change extracts and therefore invalidate cached judgments. Singleton/packed equivalence across models still needs measurement; an API request containing multiple questions is not itself a guarantee of statistically independent outputs.
+
+## Controls and observable coverage
+
+Keep the normal controls small: manual on/off, Rerank/Cancel/Use local ranking, desired candidates, and Context: Auto. Put total request cap, custom per-side context and Complete text only in advanced settings.
+
+Show factual outcome counts, for example: “30 notes reranked in one request; source shortened; 18 complete candidate texts and 12 excerpts.” Display actual selected source/anchor counts and an expandable evidence preview. A text-coverage percentage is not a percentage of meaning preserved. Keep original cosine visible alongside model relevance without blending them.
+
+The existing 2.5-second deadline needs a measured replacement for longer inputs. Preserve cancellation, atomic publication and the local fallback. Evaluate long sources, answer-bearing endings/interiors, multilingual notes, large code/tables, many short candidates and a few very long candidates. These recommendations specify the next implementation; this branch's runtime still implements the earlier bounded Search reranker.
