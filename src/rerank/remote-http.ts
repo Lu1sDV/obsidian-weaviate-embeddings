@@ -15,6 +15,7 @@ type RequestFactory = (url: URL, options: RequestOptions, callback: (response: I
 
 function statusError(status: number): RerankError {
   if (status === 401 || status === 403) return new RerankError("authentication", false, status);
+  if (status === 402) return new RerankError("credits", false, status);
   if (status === 400 || status === 422) return new RerankError("contract", false, status);
   if (status === 429) return new RerankError("rate-limit", true, status);
   return new RerankError("provider", status >= 500, status);

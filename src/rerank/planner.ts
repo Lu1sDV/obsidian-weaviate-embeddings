@@ -1,7 +1,8 @@
 import type { RetrievedNoteCandidate } from "../weaviate";
 import { selectEvidence } from "./evidence";
 import { packRequests, type RequestBatch } from "./systemone";
-import { LIMITS, operationBudget, RerankError, type EvidenceRecord, type Provider } from "./types";
+import { LIMITS, operationBudget, RerankError, type EvidenceRecord } from "./types";
+import type { ValidatedDecisionModel } from "./model-catalog";
 
 export interface RerankPlan {
   candidates: readonly RetrievedNoteCandidate[];
@@ -22,12 +23,12 @@ function planCount(
   candidates: readonly RetrievedNoteCandidate[],
   count: number,
   query: string,
-  provider: Provider,
+  model: ValidatedDecisionModel,
   passagesPerNote: 1 | 2,
 ): RerankPlan {
   const selected = candidates.slice(0, count);
   const records = selectEvidence(selected, query, passagesPerNote);
-  const batches = packRequests(provider, query, records);
+  const batches = packRequests(model, query, records);
   const tokens = batches.reduce((sum, batch) => sum + batch.estimatedTokens, 0);
   const budget = operationBudget(passagesPerNote);
   if (batches.length > budget.maxBatches || tokens > budget.operationTokens) throw new RerankError("budget");
@@ -43,13 +44,13 @@ export function planRerank(
   candidates: readonly RetrievedNoteCandidate[],
   minimumCandidateCount: number,
   query: string,
-  provider: Provider,
+  model: ValidatedDecisionModel,
   passagesPerNote: 1 | 2,
 ): RerankPlan {
   let baselinePlan: RerankPlan | undefined;
   for (const count of cohortSizes(candidates.length, minimumCandidateCount)) {
     try {
-      baselinePlan = planCount(candidates, count, query, provider, 1);
+      baselinePlan = planCount(candidates, count, query, model, 1);
       break;
     } catch (error) {
       if (!(error instanceof RerankError && error.reason === "budget")) throw error;
@@ -59,5 +60,5 @@ export function planRerank(
   if (passagesPerNote === 1) return baselinePlan;
 
   // Never continue shrinking here: doing so would confound evidence breadth with candidate breadth.
-  return planCount(candidates, baselinePlan.candidates.length, query, provider, 2);
+  return planCount(candidates, baselinePlan.candidates.length, query, model, 2);
 }

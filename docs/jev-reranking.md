@@ -1,102 +1,83 @@
-# JEV Search reranking: implemented architecture
+# Single-request System One reranking
 
-Baseline: `master` at `3c4e3173e514679806a44e7d2708602facd9f6d2`. JEV remains an optional application-layer Search feature. It does not change embedding models, chunking, index generations, vector dimensions, Weaviate schema, local admission, source identity, or graph cosine semantics.
+Implemented on the OpenRouter review branch, based on `c162b1e` (with a temporary CI bootstrap at `4c8fa80`). No embedding profile, vector schema, chunking policy or index-generation changes are required.
 
-## Shipping scope
+## Setup and controls
 
-- Search only.
-- Manual **Rerank with JEV** action; disabled by default.
-- OpenRouter (`typesafe/jev-1.13`) or direct TypeSafe (`jev-1.13.0`), selected explicitly.
-- Exact already-published local Search results remain visible and are the failure fallback.
-- Wider local retrieval exists only to build the rerank pool.
-- Up to 60 admitted candidate notes; final display remains at most 30.
-- One evidence passage per note by default; two is an explicit experiment.
-- Candidate-local Noul questions are packed with query-only shared state, up to 24 questions/request.
-- No relevance threshold, no retrieval/JEV arithmetic fusion, no generative explanation stage.
-- No automatic retries and no silent provider failover.
-- RAM-only scalar judgment cache.
-- Connections remains local-only.
+Save an OpenRouter key, enter a text-capable Decisions model ID, and select **Save & validate**. The authenticated paginated catalogue resolves aliases/canonical serving identities and rejects incompatible specialised-state models. One synthetic arithmetic inference checks the runtime source/candidate/Noul wire shape; it sends no vault content and may incur a small charge. Approval is session-local, expires after 24 hours, and is bound to model and credential revisions. A catalogue check alone never enables reranking.
 
-## Retrieval contracts
+Explicitly grant source/candidate upload permission and turn manual reranking on. Search and Connections share sidebar controls: on/off, Rerank/Cancel/Use local ranking, candidate count and Adaptive/Complete notes policy. Enabling, typing, opening a note and automatic local refresh never initiate inference. Settings expose Auto/manual context, per-side context and total nominal token cap. Invalid numeric values cannot bypass limits.
 
-`WeaviateClient.hybridDetailed()` is the migration seam. It returns one `HybridWindow` containing both the legacy-compatible grouped note results and the flat retrieved passages with their actual window-local `retrievalScore` and deterministic `retrievalRank`. Existing `hybrid()` delegates to `hybridDetailed()` and projects the grouped results, so disabled/local-only Search keeps the old score and ordering contract.
+The model, credential and policy changes invalidate affected work and cached judgments. Changing models resets consent. Format-v1/v2 settings migrate to v3 disabled, with fresh expanded-disclosure consent required. The saved OpenRouter key is retained; direct-provider credentials are never reused for OpenRouter.
 
-`SearchRetrievalService` owns Search window retrieval. Ordinary Search still follows 300 → 600 → 1200 passage windows until 30 current visible notes are available or the retrieval window is exhausted. The manual JEV continuation reuses the saved final local window, then widens only if necessary. A later window replaces the earlier one; relative-score-fusion values from different windows are never merged.
+## Source and evidence contracts
 
-The saved local baseline and the rerank pool are separate immutable concepts. Rerank failure cannot silently substitute a widened local ranking for what the user had already seen.
+A source is a typed query, a whole indexed note, or a selected indexed passage. `src/rerank/documents.ts` verifies hydrated evidence before remote work. A fresh Markdown read must reproduce the indexed canonical body SHA-256. Stored note/snapshot/path identity, ordered manifest passage IDs, offsets and exact source slices must agree. The existing `loadSnapshot()` validates generation, model fingerprint and vectors. Fresh raw frontmatter is also checked against the stored normalized metadata and disclosure policy, because Obsidian's metadata cache can lag an edit. File modification stamps and current manifest/admission checks surround asynchronous boundaries.
 
-## Evidence and cloud policy
+There is a 4 MiB source-document bound, 32 MiB aggregate hydration bound and bounded parser work/line/segment counts. Excessive or corrupt inputs retain local results rather than uploading unverified material. No text is read from linked destinations. A local database read already underway can finish after cancellation, but cannot dispatch remote work or publish results.
 
-Evidence comes only from the retrieved indexed snapshot, never newly edited live Markdown. `passage-v1` sends `title + heading + bounded passage body`. Paths, note IDs, snapshot IDs, passage IDs, vectors, retrieval scores, frontmatter objects, generation IDs, and purge state stay local. Evidence truncation is UTF-8 bounded and query-aware; minimization is not anonymization.
+For whole-note Connections, the source's stored note vector is compared locally with each candidate's stored passage vectors. Selected-passage Connections uses its stored passage vector. Search preserves retrieved passage anchors. Same-note passage hits are grouped before evidence selection, rather than discarded by the ordinary display projection. No new embedding call or retrieval-score upload is needed.
 
-The production policy selects exactly one strongest retrieved passage per candidate. The setting `2 — experimental` permits a second distinct non-overlapping passage. Candidate breadth is planned under the one-passage policy first; the two-passage arm must score that exact cohort under its larger experimental operation budget or bypass entirely, so evidence breadth cannot silently change candidate breadth. There is no neighboring-context hydration in the shipping path; a future `passage-neighbors-v1` experiment must be separately versioned because it changes disclosure and late-chunking evidence.
+### Adaptive context
 
-Remote disclosure is independent of local indexing admission. A note must still be current and locally admitted, provider consent must be active, the selected route must be configured, remote folder/file exclusions must allow the path, and `ai_remote: false` / `ai_rerank: false` must not veto it. If any note required by the selected cohort is remote-ineligible, the whole rerank is skipped and the local baseline remains.
+Complete cleaned short notes are preserved when useful within the budget. Oversized whole-note candidates prioritize strongest distinct interior matches plus substantive introduction/final content, nominally 70/15/15 with unused/overlapping allowance redistributed. An oversized whole-note source covers representative sections; it is not redefined separately for each candidate. All questions use the exact same source representation.
 
-## Planning and request representation
+Passage mode protects the complete selected source passage and labels focus versus context. Surrounding windows grow within the relevant heading scope. If that selected passage cannot fit, no inference is sent; select a smaller passage or change the model/budget. Candidate chunks may be shortened explicitly. Whole-note opening/end text is not added automatically to passage-mode evidence.
 
-`planRerank()` plans a complete cohort before any network write. Candidate breadth is chosen once using the release one-passage policy: it attempts the available candidate count, then deterministic smaller cohorts (including 48, 40, 30 and the current display floor) until that complete plan fits. If the current displayed note count itself cannot fit, the rerank is bypassed.
+Overlapping ranges merge and remain in source order. Omitted ranges, partial fragments, headings and text format are represented explicitly. Partial tables retain header rows, nested list extracts retain relevant parents, and code indentation is preserved. The focus passage remains separate from explanatory surroundings.
 
-The two-passage experiment then reuses exactly that candidate cohort. It receives a larger bounded operation budget (up to six packed requests and 128k conservative estimated tokens across the operation, versus three / 64k for one passage). Each individual request remains under the existing 24k conservative estimate. If the exact cohort still cannot fit, the rerank is bypassed instead of shrinking to a different candidate set.
+### Complete notes only
 
-Planning uses both serialized-byte bounds and a conservative token estimate. The estimate is not presented as the JEV tokenizer. Provider-reported usage is retained separately in content-free operation metrics.
+The planner takes the largest leading candidate prefix that fits its conservative serialized guards without shortening whole notes. It never skips a large high-ranked candidate to admit shorter lower-ranked notes. If no complete comparison fits, local results remain. A passage target remains the selected passage plus bounded context, not an implicit change to the whole source note.
 
-Each System One request has shared `state.query`; each opaque question contains one candidate evidence object plus the fixed `search-relevance-noul-v1` rubric. The structured question explicitly refers to `query` and `candidate` by their actual field names. Packed questions are independent candidate-local judgments. A singleton request mode remains in the developer contract probe as the comparison oracle for packing experiments.
+### Markdown projection
 
-## Ranking and provenance
+`markdown.ts` is a bounded non-rendering structural scanner, not an HTML renderer or a claim of complete CommonMark/Obsidian syntax parity. It protects fenced, indented and inline code and escaped syntax; removes real Markdown/HTML image targets, image-only reference definitions (including continuations), Obsidian embeds, SVG and data-image payloads outside code; and preserves meaningful textual descriptions. Ordinary text links retain their labels and relevant URLs. Attachments/transclusions are not expanded. Exotic unsupported syntax should be examined in the local evidence preview; provider disclosure permission still covers the supplied text.
 
-Each passage receives a validated Noul relevance in `[0,1]`. For a note, relevance is `max(passage relevance)` over the selected evidence. Notes sort by relevance descending, then their rank in the single expanded retrieval window, then deterministic note identity. Passages within a note sort by relevance, original retrieval rank, then identity.
+The projection changes only outbound evidence. Stored Markdown, embedding inputs, index identities and source coordinates remain unchanged. Cleaned offsets map back to the verified source ranges.
 
-`SearchResult.score` is never overwritten. JEV metadata stores the route, requested model, served model, optional OpenRouter upstream provider, rubric/evidence/ranking versions, winning passage, complete coverage marker, and every passage judgment with evidence hash and original retrieval rank. A network failure or missing judgment is never converted to relevance zero.
+## Exactly one runtime inference
 
-Search graph vectors are fetched only for the final reranked membership. Edges are rebuilt from stored note vectors, so cosine remains cosine. A graph reconstruction failure keeps the valid ranked list and marks the graph unavailable.
+`RerankService.run()` builds the entire plan before dispatch and contains one `provider.evaluate()` call. A request has shared `state.source` and one typed Noul question per candidate. No cosine, local score/rank, note ID, snapshot ID or path is inserted into that wire representation. Text may itself contain identifying information; minimization is not anonymization.
 
-## Serving identity
+There are no overflow batches, automatic retry, secondary summarization call or hidden fallback model. A complete exact cached cohort can avoid inference entirely; partial cache hits do not mix judgments from different comparison contexts. All returned question IDs, Noul values, serving identity and usage must validate before publication. Zero is a valid relevance value; missing/invalid responses are not converted to zero.
 
-The provider adapters are explicit:
+Synthetic model validation uses the same planner and wire shape. The optional developer command `OPENROUTER_MODEL=author/model OPENROUTER_API_KEY=... npm run test:jev-contract` performs catalogue reads and **one** synthetic multi-candidate inference with that shape. It never reads a vault. Older singleton/packing helpers remain only as regression/reference utilities; the runtime service and probe do not invoke their batch planner.
 
-- `OpenRouterSystemOneProvider` → fixed `https://openrouter.ai/api/v1/systemone`
-- `TypeSafeSystemOneProvider` → fixed `https://api.typesafe.ai/v1/systemone`
+## Budgeting
 
-The request model and response serving identity are separate. The implementation accepts only explicitly approved serving identities. OpenRouter additionally records its response `provider`. Every batch in one logical rerank must report the same compatible serving identity; a change rejects the complete job, clears incompatible cache assumptions, and retains local results.
+Defaults: 30 requested candidates (1–60), 30 maximum displayed results, Adaptive context, nominal 64,000-token request cap, Auto context and preferred 512 tokens per side. Auto can grow to 2,048 per side, subject to a shared document/request budget; manual context is 128–8,192 per side. Whole-note source and useful candidate minimums receive allocations first, then shorter notes return unused space to other candidates. Candidate allowance is not weighted by cosine.
 
-The synthetic connection test sends built-in arithmetic only. It is a protocol/provenance probe, not evidence of ranking quality or a release benchmark.
+The complete serialized request, including all question criteria/framing and evidence labels, is checked. Each state-plus-one-question view is checked too. Known Jev 1.13/1.14 defaults are constrained to 64k request/32k question before margins; the implementation does not assume OpenRouter enables or forwards TypeSafe's optional long-context header. Other model metadata and documented text-truncation advisories constrain the plan.
 
-## Lease, cancellation, and publication
+**There is no validated exact tokenizer for every supported decision model.** `estimatedTokens` is UTF-8 bytes divided by two, rounded up. It is a planning estimate, not a proven token upper bound. Independent conservative byte guards cap the payload at 75% of the minimum applicable token-count value (and 512k transport bytes), with additional estimate/headroom checks. This can use substantially less than advertised capacity: a 64k Jev request typically has a 48k-byte/24k-estimated-token envelope, and individual questions a 24k-byte/12k-estimated-token envelope. The user cap constrains both planning and the byte guard. The UI displays the effective estimated budget; it does not promise exact maximum-fitting K or full model-context utilization.
 
-Every remote job is bound to an immutable `RerankLease`: session ID, Search epoch, query hash, filters hash, generation, embedding fingerprint, cloud/settings/consent/credential revisions, baseline/candidate windows, deadline, and AbortSignal. The view also keeps the exact query/filter/current-snapshot closure.
+No provider response is proof that omitted or silently truncated content was read. The catalogue and synthetic probe establish capabilities/protocol, not ranking quality or long-document coverage. See the current primary references below for provider caveats.
 
-Currentness and authorization are checked before planning/cache use, before queue entry/dispatch, synchronously immediately before the network write, after responses, before reduction/cache insertion, after final graph retrieval, and before publication. A note-scoped edit/delete invalidation aborts only jobs whose candidate cohort contains that note; unrelated jobs and snapshot-bound cached judgments remain usable. Global query/mode/runtime/settings/consent/provider/credential changes still invalidate all affected work. If an already-published JEV view cannot restore its exact saved local baseline after a snapshot change, it clears immediately rather than leaving the stale reranked list visible.
+## Ranking, display and lifecycle
 
-Remote work is outside the serialized local `runQueries()` lane. The plugin owns one global two-request semaphore; each view owns its active AbortController. Publication is atomic: only complete compatible judgments can replace the display. Partial cohorts never publish.
+Each candidate receives one note-level relevance judgment from its selected evidence. Notes sort by descending relevance, with stable original input order for exact ties. Scores are not blended with cosine or hybrid retrieval scores, which remain unchanged and visible. Search graph edges are rebuilt from final membership's stored vectors. Connections graph edges retain source-to-candidate cosine. Graph read failure does not remove a valid ranked list.
 
-## Transport and failure behavior
+The original published local list and graph are saved separately from any expanded candidate window. Failures restore/retain that exact baseline. An invalid baseline is cleared rather than leaving stale relevance visible. Hybrid expansion replaces whole 300/600/1200 windows; normalized scores from different windows are never merged. Connections similarly retains its actual saved retrieval-window provenance.
 
-`src/local-http.ts` is unchanged. Cloud traffic uses `src/rerank/remote-http.ts`: HTTPS only, fixed origins/paths, TLS verification, no redirects, bounded headers/request/response bodies, identity encoding, AbortSignal cancellation, and an absolute 2.5-second remote-operation deadline. Provider response bodies, note text, queries, paths, and credentials are not included in thrown errors.
+Preparation and graph work have a 30-second total deadline; service/network work has a 20-second deadline within it. These are provisional operational bounds, not measured latency guarantees. Two requests may run globally across separate views, but each action still sends at most one. Cancellation physically aborts HTTP; queue entries cancel before dispatch. Consent/key/model/settings/source/candidate/query/target changes invalidate affected work. Unrelated index publications coalesce and defer while a current manual ranking is running, pending Apply or displayed.
 
-Failure classes are explicit: 401/403 authentication, 400/422 contract/configuration, 429 rate limit/cooldown, transient 5xx/529/provider failures, invalid JSON/schema, oversized response, deadline, cancellation, and model change. Interactive retries are zero. Repeated transient failures open a short route circuit; 429 immediately cools the route.
+Interaction defers result reordering to **Apply**. A completed pending result does not expire merely because its finished request deadline passes; it still rechecks current source/candidate snapshots, disclosure, file stamps and settings. The UI reports actually judged/requested counts, full/excerpt counts, source shortening, estimated budget and omitted anchors. A volatile local preview shows the exact evidence used. Text-coverage counts are not semantic-coverage guarantees.
 
-## Device-local settings and secrets
+## Privacy, cache and diagnostics
 
-JEV state is never written to the vault's `data.json` and never appended to the existing Weaviate credential writer.
+Local admission plus `ai_remote`/`ai_rerank`, remote file/folder exclusions and model-specific consent apply to both source and all candidate notes. Any veto skips the whole operation, retaining private notes' place in local results. Settings and credentials are separate device-local permission-restricted files under the per-vault runtime directory, never vault `data.json`. Permissions are access control, not encryption.
 
-- `rerank-settings.json`: nonsecret rerank settings plus provider-scoped consent.
-- `rerank-credentials.json`: OpenRouter/TypeSafe keys only.
+The bounded RAM cache contains hashes/provenance and scalar scores only, with a 15-minute TTL. Identity includes exact source, cleaned/extracted candidate cohort, selected model/served revision, rubric, budget-derived wire text, embedding generation/fingerprint and policy/credential revisions. Changed K/context often changes evidence and therefore invalidates reuse. Raw queries, note bodies, paths, keys and request/response payloads are not logged or persisted by the rerank subsystem. Error messages are sanitized. Cost remains null when a dispatched response lacks trustworthy priced usage, not a misleading zero.
 
-Both live under the existing per-vault device runtime directory, are atomically replaced with restrictive file permissions, and carry a matching write snapshot ID so a torn two-file update fails closed. The loader migrates the earlier unmerged experimental combined-file format. Filesystem permissions are access control, not encryption.
+## Validation and remaining release gates
 
-## Cache and observability
+See [phase-2 review](phase-2-reranking-review.md) for completed checks and reproduced/fixed defects. Automated tests are offline/mocked except existing loopback transport tests. They do not establish funded OpenRouter inference, interactive Obsidian/Electron behavior, real-vault relevance gains or actual cost/latency. Those remain explicit gates; the PR stays a draft and is not merged to master.
 
-The cache contains only scalar passage judgments keyed by hashes/provenance; it never stores raw query/evidence text. Keys bind vault scope, route, requested/served model, upstream provider, primitive/rubric/evidence/ranking versions, query/filter identity, generation/fingerprint, note/snapshot/passage identity, exact evidence hash, and cloud/settings/consent/credential revisions. It is memory-only, vault-scoped, LRU/byte bounded, and expires after 15 minutes.
+## Primary API references (checked 2026-11-02)
 
-Operation metrics are content-free: retrieval windows, candidate/exhaustion counts, evidence/truncation counts, request count, estimated/provider-reported tokens, cost when supplied, cache hits, elapsed time, served model, and upstream provider. Raw queries, bodies, paths, frontmatter, API keys, request bodies, and response bodies are not logged by the rerank subsystem.
-
-## Validation
-
-CI runs `npm ci`, `npm run typecheck`, `npm test`, `npm run eval:rerank`, and `npm run package`. The test matrix covers legacy retrieval projection, flat passage rank provenance, window replacement, policy vetoes, split settings/secrets, one/two-passage evidence, UTF-8/byte bounds, explicit structured-field references, packed query-only state, candidate-cohort parity across one/two-passage planning, strict response parsing, dated OpenRouter serving provenance, max aggregation, score/cosine separation, note-scoped versus global invalidation, stale-baseline clearing, partial-batch failure, serving-identity drift, stale snapshot suppression, global concurrency, physical cancellation, deadlines, budget rejection, circuit breaking, and synthetic connection isolation.
-
-The included evaluation corpus is intentionally synthetic and exists only to exercise metrics/reporting. It is not evidence that JEV improves the vault. A real release decision still requires the RFC's frozen-candidate and end-to-end human-reviewed evaluation, including current local, widened local, current-30+JEV, widened+JEV, one/two-passage, singleton/packed, language, chunking, latency, fallback, cost, and regression arms.
-
-## Deferred
-
-Automatic Search reranking remains disabled. Neighbor-context evidence, graded Score, retrieval/JEV fusion, selected-passage Connections, and whole-note Connections remain separate experiments. Whole-note Connections must not upload complete long notes merely to make reranking convenient.
+- [OpenRouter Jev / Decisions guide](https://openrouter.ai/docs/guides/community/jev)
+- [Decisions API](https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request)
+- [Decision-model catalogue](https://openrouter.ai/api/v1/models?output_modalities=decisions)
+- [TypeSafe request/question and long-context limits](https://docs.typesafe.ai/models)
+- [OpenRouter documented text truncation](https://openrouter.ai/docs/guides/community/multimodal-decisions#limits)

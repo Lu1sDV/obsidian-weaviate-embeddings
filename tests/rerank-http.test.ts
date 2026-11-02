@@ -8,7 +8,7 @@ import { createRemoteTransport, type RemoteRequest } from "../src/rerank/http";
 import { LIMITS, PROVIDERS, RerankError, type Provider } from "../src/rerank/types";
 
 function options(patch: Partial<RemoteRequest> = {}): RemoteRequest {
-  return { provider: "typesafe", apiKey: "synthetic-key", body: "{}", signal: new AbortController().signal,
+  return { provider: "openrouter", apiKey: "synthetic-key", body: "{}", signal: new AbortController().signal,
     deadlineAt: performance.now() + 1000, beforeSend: () => {}, ...patch };
 }
 function harness(status = 200, body: Buffer | null = Buffer.from("{}"), headers: Record<string, string> = {}) {
@@ -36,7 +36,7 @@ function reason(expected: string, transient?: boolean): (error: unknown) => bool
 }
 
 test("remote transport uses only the pinned HTTPS origin/path and verified TLS", async () => {
-  for (const provider of ["typesafe", "openrouter"] as const) {
+  for (const provider of ["openrouter"] as const) {
     const mock = harness(); assert.equal(await mock.transport(options({ provider })), "{}");
     const captured = mock.state().captured!;
     assert.equal(captured.url.href, PROVIDERS[provider].url);
@@ -46,7 +46,7 @@ test("remote transport uses only the pinned HTTPS origin/path and verified TLS",
   }
 });
 test("disallowed destinations, header injection, oversized requests and expired deadlines never create HTTP", async () => {
-  for (const patch of [{ provider: "arbitrary" as Provider }, { apiKey: "secret\r\nHost: attacker" },
+  for (const patch of [{ provider: "arbitrary" as Provider }, { provider: "typesafe" as Provider }, { apiKey: "secret\r\nHost: attacker" },
     { body: "x".repeat(LIMITS.requestBytes + 1) }, { deadlineAt: performance.now() - 1 }]) {
     const mock = harness(); await assert.rejects(mock.transport(options(patch)), RerankError); assert.equal(mock.state().calls, 0);
   }

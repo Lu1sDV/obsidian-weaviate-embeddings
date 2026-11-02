@@ -18,6 +18,7 @@ import { defaultRerankSettings, LIMITS, RerankError, type RerankAccess, type Rer
 import type { RemoteRequest, RemoteTransport } from "../src/rerank/remote-http";
 import type { SearchResult } from "../src/types";
 import type { HybridWindow, RetrievedNoteCandidate } from "../src/weaviate";
+import { MODEL, fakeModelRegistry } from "./helpers/rerank-model";
 
 function result(index: number, passages = 1): SearchResult {
   return {
@@ -63,12 +64,14 @@ function window(items: readonly RetrievedNoteCandidate[], limit: number): Hybrid
 function configured(patch: Partial<RerankAccess> = {}): RerankAccess {
   return {
     ...defaultRerankSettings(),
-    provider: "typesafe",
+    provider: "openrouter",
+    model: MODEL.requestedModel,
     enabled: true,
     evidencePassages: 1,
     consent: true,
     apiKey: "synthetic-test-key",
     revision: 0,
+    modelRevision: 0,
     settingsRevision: 0,
     cloudPolicyRevision: 0,
     consentRevision: 0,
@@ -77,8 +80,20 @@ function configured(patch: Partial<RerankAccess> = {}): RerankAccess {
   };
 }
 
+function serviceWithModel(access: () => RerankAccess, transport: RemoteTransport): RerankService {
+  return new RerankService(access, transport, fakeModelRegistry());
+}
+
 function input(candidates: readonly RetrievedNoteCandidate[] = [candidate(0), candidate(1)], patch: Partial<RerankInput> = {}): RerankInput {
   return {
+    source: { kind: "search", title: "", text: patch.query ?? "Evidence", anchors: [] },
+    documents: (patch.candidates ?? candidates).map(item => {
+      let text = "";
+      const anchors = item.passages.map(passage => { const start = text.length; text += passage.body + "\n\n";
+        return { start, end: text.length - 2, passageId: passage.passageId }; });
+      return { title: item.result.title, text, anchors };
+    }),
+    isSourceAllowed: () => true,
     vaultId: "vault",
     generation: 1,
     fingerprint: "fingerprint",
@@ -97,13 +112,13 @@ function input(candidates: readonly RetrievedNoteCandidate[] = [candidate(0), ca
   };
 }
 
-function response(options: RemoteRequest, score = 0.8, model = "jev-1.13.0", upstream = "TypeSafe"): string {
+function response(options: RemoteRequest, score = 0.8, model = MODEL.canonicalSlug, upstream = "TypeSafe"): string {
   const request = JSON.parse(options.body) as { questions: Record<string, unknown> };
   return JSON.stringify({
     model,
-    ...(options.provider === "openrouter" ? { provider: upstream } : {}),
+    provider: upstream,
     answers: Object.fromEntries(Object.keys(request.questions).map(key => [key, { type: "noul", noul: score }])),
-    usage: { input_tokens: 100, output_tokens: 4, ...(options.provider === "openrouter" ? { cost: 0.00001 } : {}) },
+    usage: { input_tokens: 100, output_tokens: 4, cost: 0.00001 },
   });
 }
 
@@ -157,6 +172,8 @@ test("widening replaces the complete relative-fusion window and stale work is di
 test("remote policy is a veto only and requires current metadata", () => {
   const settings = validateRerankSettings({ excludedFolders: ["Secret"], excludedFiles: ["One.md"] });
   assert.equal(settings.enabled, false);
+  assert.equal(settings.provider, "openrouter");
+  assert.equal(settings.model, "");
   assert.equal(settings.evidencePassages, 1);
   assert.equal(remoteNoteAllowed(settings, "Public.md", undefined), false);
   assert.equal(remoteNoteAllowed(settings, "Public.md", {}), true);
@@ -168,6 +185,7 @@ test("remote policy is a veto only and requires current metadata", () => {
   assert.equal(remoteNoteAllowed(settings, "Secrets/A.md", {}), true);
   assert.equal(remoteNoteAllowed(settings, "One.md", {}), false);
   assert.throws(() => validateRerankSettings({ evidencePassages: 3 }));
+  assert.throws(() => validateRerankSettings({ provider: "typesafe" }));
   assert.equal("apiKey" in validateRerankSettings({ apiKey: "never-save-here" }), false);
 });
 
@@ -178,15 +196,17 @@ test("device-local settings split policy from credentials and preserve restricti
     const store = new RerankStore("vault", () => { changes++; }, directory);
     await store.load();
     assert.equal(store.access().enabled, false);
-    await store.setConsent("typesafe", true);
-    await store.setKey("typesafe", "not-a-real-key");
-    await store.configure({ enabled: true, provider: "typesafe", evidencePassages: 2 });
+    await store.configure({ enabled: true, provider: "openrouter", model: MODEL.requestedModel, evidencePassages: 2 });
+    await store.setConsent("openrouter", true);
+    await store.setKey("openrouter", "not-a-real-key");
     assert.ok(changes >= 3);
 
     const reopened = new RerankStore("vault", () => {}, directory);
     await reopened.load();
     assert.equal(reopened.access().apiKey, "not-a-real-key");
     assert.equal(reopened.access().evidencePassages, 2);
+    assert.equal(reopened.access().model, MODEL.requestedModel);
+    assert.equal(reopened.access().consent, true);
 
     const settingsFile = join(directory, "rerank-settings.json");
     const credentialFile = join(directory, "rerank-credentials.json");
@@ -202,6 +222,42 @@ test("device-local settings split policy from credentials and preserve restricti
     await writeFile(settingsFile, "{broken");
     await assert.rejects(reopened.load());
     assert.equal(reopened.access().enabled, false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy direct-provider settings migrate disabled without reusing its key or consent", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "rerank-migration-"));
+  try {
+    const writeId = "11111111-1111-1111-1111-111111111111";
+    await Promise.all([
+      writeFile(join(directory, "rerank-settings.json"), JSON.stringify({
+        version: 1,
+        writeId,
+        settings: { enabled: true, provider: "typesafe", evidencePassages: 2, excludedFolders: ["Private"], excludedFiles: [] },
+        consent: { openrouter: true, typesafe: true },
+      })),
+      writeFile(join(directory, "rerank-credentials.json"), JSON.stringify({
+        version: 1,
+        writeId,
+        openrouterApiKey: "saved-router-key",
+        typesafeApiKey: "must-not-route-this-key",
+      })),
+    ]);
+    const store = new RerankStore("vault", () => {}, directory);
+    await store.load();
+    const migrated = store.access();
+    assert.equal(migrated.provider, "openrouter");
+    assert.equal(migrated.enabled, false);
+    assert.equal(migrated.consent, false);
+    assert.equal(migrated.apiKey, "saved-router-key");
+    assert.deepEqual(migrated.excludedFolders, ["Private"]);
+
+    await store.configure({ model: "example/decision-model" });
+    const credentialText = await readFile(join(directory, "rerank-credentials.json"), "utf8");
+    assert.ok(!credentialText.includes("must-not-route-this-key"));
+    assert.ok(!credentialText.includes("typesafeApiKey"));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -232,9 +288,9 @@ test("long multilingual evidence stays byte-bounded and source identities remain
 
 test("packed requests use query-only state, opaque keys, and at most 24 independent questions", () => {
   const records = selectEvidence(Array.from({ length: 40 }, (_, index) => candidate(index)), "query");
-  const singleton = JSON.parse(requestBatch("typesafe", "query", records.slice(0, 1), "singleton").body);
+  const singleton = JSON.parse(requestBatch(MODEL, "query", records.slice(0, 1), "singleton").body);
   assert.deepEqual(singleton.state, { query: "query" });
-  const batches = packRequests("openrouter", "query", records);
+  const batches = packRequests(MODEL, "query", records);
   assert.ok(batches.length >= 2);
   assert.equal(batches.reduce((sum, batch) => sum + batch.records.length, 0), 40);
   for (const batch of batches) {
@@ -250,10 +306,40 @@ test("packed requests use query-only state, opaque keys, and at most 24 independ
   }
 });
 
+test("requests and judgments bind the validated user model instead of a fixed JEV model", () => {
+  const selected = {
+    ...MODEL,
+    requestedModel: "example/decisions-latest",
+    modelId: "example/decisions-2",
+    canonicalSlug: "example/decisions-2-20261031",
+    acceptedServedModels: ["example/decisions-2", "example/decisions-2-20261031"],
+  };
+  const records = selectEvidence([candidate(0)], "query");
+  const body = JSON.parse(requestBatch(selected, "query", records, "singleton").body);
+  assert.equal(body.model, selected.requestedModel);
+  const wire = JSON.stringify({
+    model: selected.canonicalSlug,
+    answers: { p000: { type: "noul", noul: 0.7 } },
+    usage: { input_tokens: 20, output_tokens: 1 },
+  });
+  assert.equal(parseJudgments(wire, selected, ["p000"]).servingIdentity.requestedModel, selected.requestedModel);
+  assert.throws(() => parseJudgments(wire, MODEL, ["p000"]), (error: unknown) =>
+    error instanceof RerankError && error.reason === "model-change");
+});
+
+test("small model contexts and documented text limits reject oversized evidence before dispatch", () => {
+  const records = selectEvidence([candidate(0, 1, 1200)], "Evidence");
+  assert.ok(requestBatch(MODEL, "Evidence", records, "singleton").body.length > 1200);
+  for (const selected of [{ ...MODEL, contextTokens: 1024 }, { ...MODEL, fullTextTokenLimit: 256 }]) {
+    assert.throws(() => requestBatch(selected, "Evidence", records, "singleton"), (error: unknown) =>
+      error instanceof RerankError && error.reason === "budget");
+  }
+});
+
 test("two-passage planning preserves the one-passage candidate cohort", () => {
   const items = Array.from({ length: 60 }, (_, index) => candidate(index, 2, 800));
-  const one = planRerank(items, 30, "Evidence", "typesafe", 1);
-  const two = planRerank(items, 30, "Evidence", "typesafe", 2);
+  const one = planRerank(items, 30, "Evidence", MODEL, 1);
+  const two = planRerank(items, 30, "Evidence", MODEL, 2);
   assert.equal(one.candidates.length, 60);
   assert.equal(two.candidates.length, one.candidates.length);
   assert.equal(two.records.length, 120);
@@ -269,7 +355,7 @@ test("reranked invalidation clears when an exact local baseline cannot be restor
 });
 
 const validWire = () => ({
-  model: "jev-1.13.0",
+  model: MODEL.canonicalSlug,
   answers: { p000: { type: "noul", noul: 0.8 } },
   usage: { input_tokens: 10, output_tokens: 1 },
 });
@@ -278,7 +364,7 @@ test("strict wire validation accepts real zeros and rejects malformed or unappro
   for (const value of [0, 0.8, 1]) {
     const body = validWire();
     body.answers.p000.noul = value;
-    assert.equal(parseJudgments(JSON.stringify(body), "typesafe", ["p000"]).scores.get("p000"), value);
+    assert.equal(parseJudgments(JSON.stringify(body), MODEL, ["p000"]).scores.get("p000"), value);
   }
   for (const body of [
     '{"model":"jev-1.13.0","model":"jev-1.13.0"}',
@@ -286,7 +372,7 @@ test("strict wire validation accepts real zeros and rejects malformed or unappro
     JSON.stringify({ ...validWire(), model: "jev-latest" }),
     "{broken",
   ]) {
-    assert.throws(() => parseJudgments(body, "typesafe", ["p000"]), RerankError);
+    assert.throws(() => parseJudgments(body, MODEL, ["p000"]), RerankError);
   }
 });
 
@@ -297,7 +383,7 @@ test("OpenRouter serving provenance records an approved dated model and upstream
     answers: { p000: { type: "noul", noul: 0.7 } },
     usage: { input_tokens: 11, output_tokens: 1, cost: 0.00001 },
   });
-  const parsed = parseJudgments(body, "openrouter", ["p000"]);
+  const parsed = parseJudgments(body, MODEL, ["p000"]);
   assert.deepEqual(parsed.servingIdentity, {
     route: "openrouter",
     requestedModel: "typesafe/jev-1.13",
@@ -306,12 +392,47 @@ test("OpenRouter serving provenance records an approved dated model and upstream
   });
 });
 
+test("OpenRouter accepts an omitted upstream provider and validates it when supplied", () => {
+  const body = { ...validWire(), model: "typesafe/jev-1.13" };
+  const parsed = parseJudgments(JSON.stringify(body), MODEL, ["p000"]);
+  assert.deepEqual(parsed.servingIdentity, {
+    route: "openrouter",
+    requestedModel: "typesafe/jev-1.13",
+    servedModel: "typesafe/jev-1.13",
+  });
+  assert.equal(parsed.scores.get("p000"), 0.8);
+
+  for (const provider of [null, "", 42, "TypeSafe\n", "x".repeat(257)]) {
+    assert.throws(() => parseJudgments(JSON.stringify({ ...body, provider }), MODEL, ["p000"]), RerankError);
+  }
+});
+
+test("Noul answer extensions preserve strict score, identity, and duplicate-key validation", () => {
+  const answer = { type: "noul", noul: 0.8, metadata: { version: 2 } };
+  const wire = (answers: unknown) => JSON.stringify({ ...validWire(), answers });
+  assert.equal(parseJudgments(wire({ p000: answer }), MODEL, ["p000"]).scores.get("p000"), 0.8);
+
+  for (const invalid of [
+    { ...answer, type: "score" },
+    { ...answer, noul: "0.8" },
+    { ...answer, noul: null },
+    { ...answer, noul: -0.01 },
+    { ...answer, noul: 1.01 },
+  ]) assert.throws(() => parseJudgments(wire({ p000: invalid }), MODEL, ["p000"]), RerankError);
+
+  for (const answers of [{ p001: answer }, { p000: answer, p001: answer }]) {
+    assert.throws(() => parseJudgments(wire(answers), MODEL, ["p000"]), RerankError);
+  }
+  const duplicate = wire({ p000: answer }).replace('"version":2', '"version":2,"version":3');
+  assert.throws(() => parseJudgments(duplicate, MODEL, ["p000"]), RerankError);
+});
+
 test("max passage aggregation preserves local score semantics and graph cosine", () => {
   const items = Array.from({ length: 60 }, (_, index) => candidate(index, 2));
   const before = structuredClone(items);
   const records = selectEvidence(items, "Evidence", 2);
   const scores = new Map(records.map(record => [record.key, record.passageId === "passage-59-1" ? 0.99 : 0.01]));
-  const serving: ServingIdentity = { route: "typesafe", requestedModel: "jev-1.13.0", servedModel: "jev-1.13.0" };
+  const serving: ServingIdentity = { route: "openrouter", requestedModel: MODEL.requestedModel, servedModel: MODEL.canonicalSlug };
   const ranked = rankNotes(items, records, scores, serving);
   assert.equal(ranked.length, 30);
   assert.equal(ranked[0]!.noteId, "note-59");
@@ -351,7 +472,7 @@ for (const [name, access, allowed] of [
 ] as const) {
   test(`service bypasses ${name}/${allowed} without transmission`, async () => {
     let calls = 0;
-    const service = new RerankService(() => access, async options => { calls++; return response(options); });
+    const service = serviceWithModel(() => access, async options => { calls++; return response(options); });
     const outcome = await service.run(input(undefined, {
       isAllowed: item => allowed || item.result.noteId === "note-0",
     }));
@@ -364,7 +485,7 @@ for (const [name, access, allowed] of [
 test("complete cached jobs still recheck policy and exact provenance", async () => {
   let access = configured();
   let calls = 0;
-  const service = new RerankService(() => access, async options => {
+  const service = serviceWithModel(() => access, async options => {
     calls++;
     options.beforeSend();
     return response(options);
@@ -390,7 +511,7 @@ test("complete cached jobs still recheck policy and exact provenance", async () 
   const edited = candidate(0);
   edited.passages[0]!.body += " Changed.";
   edited.result.passages[0]!.body += " Changed.";
-  await service.run({ ...request, candidates: [edited] });
+  await service.run(input([edited]));
   assert.equal(calls, 6);
 
   access = { ...access, settingsRevision: 1, revision: 1 };
@@ -399,21 +520,22 @@ test("complete cached jobs still recheck policy and exact provenance", async () 
   assert.equal(calls, 7);
 });
 
-test("one failed batch cancels peers and never publishes or caches a partial cohort", async () => {
+test("one failed request never retries, publishes or caches a partial cohort", async () => {
   let calls = 0;
   let fail = true;
   const items = Array.from({ length: 50 }, (_, index) => candidate(index, 1, 1200));
   const transport: RemoteTransport = async options => {
     const call = ++calls;
     await wait(options.signal, call % 2 ? 1 : 5);
-    if (fail && call === 2) throw new RerankError("provider", true);
+    if (fail && call === 1) throw new RerankError("provider", true);
     return response(options);
   };
-  const service = new RerankService(() => configured(), transport);
+  const service = serviceWithModel(() => configured(), transport);
   const original = input(items, { minimumCandidateCount: 30 });
   const before = structuredClone(original.candidates);
   const first = await service.run(original);
   assert.equal(first.status, "retained");
+  assert.equal(calls, 1, "no hidden retry or overflow batch");
   assert.deepEqual(original.candidates, before);
   fail = false;
   const second = await service.run(original);
@@ -421,11 +543,11 @@ test("one failed batch cancels peers and never publishes or caches a partial coh
   assert.equal(second.metrics.cacheHits, 0);
 });
 
-test("mixed serving identities reject the complete job", async () => {
+test("an unapproved serving identity rejects the complete one-request job", async () => {
   let count = 0;
   const items = Array.from({ length: 50 }, (_, index) => candidate(index, 1, 1200));
-  const service = new RerankService(() => configured({ provider: "openrouter" }), async options =>
-    response(options, 0.8, ++count === 1 ? "typesafe/jev-1.13-20260917" : "typesafe/jev-1.13.0"));
+  const service = serviceWithModel(() => configured({ provider: "openrouter" }), async options =>
+    response(options, 0.8, ++count === 1 ? "typesafe/jev-1.13.0" : "typesafe/jev-1.13-20260917"));
   const outcome = await service.run(input(items, { minimumCandidateCount: 30 }));
   assert.equal(outcome.status, "retained");
   assert.equal(outcome.reason, "model-change");
@@ -434,7 +556,7 @@ test("mixed serving identities reject the complete job", async () => {
 test("snapshot invalidation prevents cache insertion and publication", async () => {
   let current = true;
   let calls = 0;
-  const service = new RerankService(() => configured(), async options => {
+  const service = serviceWithModel(() => configured(), async options => {
     calls++;
     current = false;
     return response(options);
@@ -451,7 +573,7 @@ test("note-scoped invalidation cancels only affected jobs and preserves unrelate
   const releaseUnrelated = deferred<void>();
   let entered = 0;
   let calls = 0;
-  const service = new RerankService(() => configured(), async options => {
+  const service = serviceWithModel(() => configured(), async options => {
     calls++;
     if (++entered === 2) bothEntered.resolve();
     if (options.body.includes("Evidence 0")) await wait(options.signal, 60_000);
@@ -473,20 +595,21 @@ test("note-scoped invalidation cancels only affected jobs and preserves unrelate
   assert.equal(calls, 2);
 });
 
-test("two-passage service uses the experimental budget without narrowing the cohort", async () => {
+test("legacy passage count never creates overflow batches in the new runtime", async () => {
   const items = Array.from({ length: 60 }, (_, index) => candidate(index, 2, 800));
-  let calls = 0;
-  const service = new RerankService(() => configured({ evidencePassages: 2 }), async options => {
-    calls++;
-    return response(options);
-  });
-  const outcome = await service.run(input(items, { minimumCandidateCount: 30 }));
-  assert.equal(outcome.status, "applied");
-  assert.equal(outcome.metrics.candidateCount, 60);
-  assert.equal(outcome.metrics.evidenceCount, 120);
-  assert.ok(outcome.metrics.requests > LIMITS.maxBatches);
-  assert.ok(outcome.metrics.requests <= LIMITS.twoPassageMaxBatches);
-  assert.equal(calls, outcome.metrics.requests);
+  const outcomes = [];
+  for (const evidencePassages of [1, 2] as const) {
+    let calls = 0;
+    const service = serviceWithModel(() => configured({ evidencePassages, candidateCount: 60 }), async options => {
+      calls++; return response(options);
+    });
+    const outcome = await service.run(input(items));
+    assert.equal(outcome.status, "applied");
+    assert.equal(outcome.metrics.requests, 1); assert.equal(calls, 1);
+    assert.ok(outcome.metrics.candidateCount > 0 && outcome.metrics.candidateCount <= 60);
+    outcomes.push(outcome);
+  }
+  assert.equal(outcomes[0]!.metrics.candidateCount, outcomes[1]!.metrics.candidateCount);
 });
 
 test("global concurrency is two across views and revocation cancels queued work", async () => {
@@ -494,7 +617,7 @@ test("global concurrency is two across views and revocation cancels queued work"
   let active = 0;
   let peak = 0;
   let access = configured();
-  const service = new RerankService(() => access, async options => {
+  const service = serviceWithModel(() => access, async options => {
     options.beforeSend();
     active++;
     peak = Math.max(peak, active);
@@ -522,7 +645,7 @@ test("query cancellation stops remote work without blocking a new local intent",
   const entered = deferred<void>();
   const controller = new AbortController();
   let calls = 0;
-  const service = new RerankService(() => configured(), async options => {
+  const service = serviceWithModel(() => configured(), async options => {
     if (++calls === 1) {
       entered.resolve();
       await wait(options.signal, 60_000);
@@ -538,32 +661,32 @@ test("query cancellation stops remote work without blocking a new local intent",
 });
 
 test("absolute deadline and preflight budget failures retain local results", async () => {
-  const slow = new RerankService(() => configured(), async options => {
+  const slow = serviceWithModel(() => configured(), async options => {
     await wait(options.signal, 60_000);
     return response(options);
   });
-  const timed = await slow.run(input([candidate(0)]));
+  const timed = await slow.run(input([candidate(0)], { deadlineAt: performance.now() + 30 }));
   assert.equal(timed.status, "retained");
   assert.equal(timed.reason, "deadline");
   assert.ok(timed.metrics.elapsedMs < LIMITS.deadlineMs + 500);
 
   let calls = 0;
-  const budgeted = new RerankService(() => configured(), async options => {
+  const budgeted = serviceWithModel(() => configured(), async options => {
     calls++;
     return response(options);
   });
   const rejected = await budgeted.run(input(Array.from({ length: 60 }, (_, index) => candidate(index)), {
-    query: "q".repeat(LIMITS.queryBytes + 1),
+    query: "q".repeat(40_000),
     minimumCandidateCount: 30,
   }));
   assert.equal(rejected.status, "retained");
-  assert.equal(rejected.reason, "budget");
+  assert.equal(rejected.reason, "source-too-large");
   assert.equal(calls, 0);
 });
 
 test("three transient outages open the route circuit; cancellation does not", async () => {
   let calls = 0;
-  const service = new RerankService(() => configured(), async () => {
+  const service = serviceWithModel(() => configured(), async () => {
     calls++;
     throw new RerankError("provider", true);
   });
@@ -576,7 +699,7 @@ test("three transient outages open the route circuit; cancellation does not", as
 
 test("synthetic connection test uses built-in text even when vault reranking is disabled", async () => {
   let payload = "";
-  const service = new RerankService(() => configured({ enabled: false, consent: false }), async options => {
+  const service = serviceWithModel(() => configured({ enabled: false, consent: false }), async options => {
     payload = options.body;
     return response(options);
   });

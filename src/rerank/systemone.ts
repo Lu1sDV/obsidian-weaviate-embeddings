@@ -1,5 +1,6 @@
 import { estimatedTokens } from "./evidence";
-import { LIMITS, PROVIDERS, RerankError, type EvidenceRecord, type JudgmentResponse, type Provider, type ServingIdentity } from "./types";
+import { LIMITS, RerankError, type EvidenceRecord, type JudgmentResponse, type ServingIdentity } from "./types";
+import type { ValidatedDecisionModel } from "./model-catalog";
 
 const QUESTION = "Does `candidate` contain information that would materially help a user satisfy the retrieval intent expressed by `query`?";
 const CRITERIA = Object.freeze({
@@ -16,7 +17,7 @@ export interface RequestBatch {
 export type RequestMode = "packed" | "singleton";
 
 export function requestBatch(
-  provider: Provider,
+  model: ValidatedDecisionModel,
   query: string,
   records: readonly EvidenceRecord[],
   mode: RequestMode,
@@ -32,34 +33,39 @@ export function requestBatch(
       criteria: CRITERIA,
     };
   }
-  const body = JSON.stringify({ model: PROVIDERS[provider].model, state: { query }, questions });
+  const body = JSON.stringify({ model: model.requestedModel, state: { query }, questions });
   const tokens = estimatedTokens(body);
-  if (Buffer.byteLength(body) > LIMITS.requestBytes || tokens > LIMITS.requestTokens) throw new RerankError("budget");
+  // Catalogue context is not a tokenizer. A separate byte ceiling and headroom deliberately
+  // constrain small-context models; known text truncation limits also constrain this request.
+  const effectiveContext = Math.min(model.contextTokens, model.fullTextTokenLimit ?? model.contextTokens);
+  const modelByteBudget = Math.floor(effectiveContext * 0.75);
+  if (Buffer.byteLength(body) > Math.min(LIMITS.requestBytes, modelByteBudget)
+    || tokens > LIMITS.requestTokens) throw new RerankError("budget");
   return { records: [...records], body, estimatedTokens: tokens };
 }
 
 /** Production packing: candidate-local questions share query-only state. */
-export function packRequests(provider: Provider, query: string, records: readonly EvidenceRecord[]): RequestBatch[] {
+export function packRequests(model: ValidatedDecisionModel, query: string, records: readonly EvidenceRecord[]): RequestBatch[] {
   const batches: RequestBatch[] = [];
   let pending: EvidenceRecord[] = [];
   for (const record of records) {
     if (pending.length) {
       try {
-        const candidate = requestBatch(provider, query, [...pending, record], "packed");
+        const candidate = requestBatch(model, query, [...pending, record], "packed");
         if (candidate.estimatedTokens > LIMITS.requestTargetTokens) {
-          batches.push(requestBatch(provider, query, pending, "packed"));
+          batches.push(requestBatch(model, query, pending, "packed"));
           pending = [];
         }
       } catch (error) {
         if (!(error instanceof RerankError && error.reason === "budget")) throw error;
-        batches.push(requestBatch(provider, query, pending, "packed"));
+        batches.push(requestBatch(model, query, pending, "packed"));
         pending = [];
       }
     }
     pending.push(record);
-    requestBatch(provider, query, pending, "packed");
+    requestBatch(model, query, pending, "packed");
   }
-  if (pending.length) batches.push(requestBatch(provider, query, pending, "packed"));
+  if (pending.length) batches.push(requestBatch(model, query, pending, "packed"));
   return batches;
 }
 
@@ -133,15 +139,15 @@ export function sameServingIdentity(left: ServingIdentity, right: ServingIdentit
     && left.upstreamProvider === right.upstreamProvider;
 }
 
-export function parseJudgments(text: string, provider: Provider, expected: readonly string[]): JudgmentResponse {
+export function parseJudgments(text: string, model: ValidatedDecisionModel, expected: readonly string[]): JudgmentResponse {
   if (Buffer.byteLength(text) > LIMITS.responseBytes || !expected.length || new Set(expected).size !== expected.length) {
     throw new RerankError("invalid-response");
   }
   const response = object(uniqueJson(text));
   const servedModel = safeText(response.model, 256);
-  if (!(PROVIDERS[provider].servedModels as readonly string[]).includes(servedModel)) throw new RerankError("model-change");
+  if (!model.acceptedServedModels.includes(servedModel)) throw new RerankError("model-change");
   let upstreamProvider: string | undefined;
-  if (provider === "openrouter") upstreamProvider = safeText(response.provider, 256);
+  if (response.provider !== undefined) upstreamProvider = safeText(response.provider, 256);
 
   const answers = object(response.answers);
   if (Object.keys(answers).length !== expected.length || expected.some(key => !Object.hasOwn(answers, key))) {
@@ -150,7 +156,7 @@ export function parseJudgments(text: string, provider: Provider, expected: reado
   const scores = new Map<string, number>();
   for (const key of expected) {
     const answer = object(answers[key]);
-    if (answer.type !== "noul" || Object.keys(answer).some(field => field !== "type" && field !== "noul")
+    if (answer.type !== "noul"
       || typeof answer.noul !== "number" || !Number.isFinite(answer.noul) || answer.noul < 0 || answer.noul > 1) {
       throw new RerankError("invalid-response");
     }
@@ -158,8 +164,8 @@ export function parseJudgments(text: string, provider: Provider, expected: reado
   }
 
   const usage = object(response.usage);
-  const inputTokens = count(usage.input_tokens ?? (provider === "openrouter" ? usage.prompt_tokens : undefined));
-  const outputTokens = count(usage.output_tokens ?? (provider === "openrouter" ? usage.completion_tokens : undefined));
+  const inputTokens = count(usage.input_tokens ?? usage.prompt_tokens);
+  const outputTokens = count(usage.output_tokens ?? usage.completion_tokens);
   if ((usage.prompt_tokens !== undefined && count(usage.prompt_tokens) !== inputTokens)
     || (usage.completion_tokens !== undefined && count(usage.completion_tokens) !== outputTokens)) {
     throw new RerankError("invalid-response");
@@ -168,8 +174,8 @@ export function parseJudgments(text: string, provider: Provider, expected: reado
     throw new RerankError("invalid-response");
   }
   const servingIdentity: ServingIdentity = {
-    route: provider,
-    requestedModel: PROVIDERS[provider].model,
+    route: "openrouter",
+    requestedModel: model.requestedModel,
     servedModel,
     ...(upstreamProvider === undefined ? {} : { upstreamProvider }),
   };

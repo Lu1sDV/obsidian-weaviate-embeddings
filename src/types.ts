@@ -128,7 +128,10 @@ export interface RerankMetadata {
   relevance: number;
   bestPassageId: string;
   evidenceCount: number;
+  /** All requested decisions validated; not a claim of complete document reading. */
   coverage: "complete";
+  evidenceCoverage?: "full" | "excerpt";
+  sourceCoverage?: "full" | "excerpt";
   judgments: readonly PassageRerankJudgment[];
 }
 

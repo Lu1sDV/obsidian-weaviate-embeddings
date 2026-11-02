@@ -1,6 +1,7 @@
 import type { RemoteTransport } from "../remote-http";
 import type { RequestBatch } from "../systemone";
 import type { JudgmentResponse, Provider } from "../types";
+import type { ValidatedDecisionModel } from "../model-catalog";
 
 export interface RerankProvider {
   readonly route: Provider;
@@ -14,4 +15,4 @@ export interface RerankProvider {
   ): Promise<JudgmentResponse>;
 }
 
-export type ProviderFactory = (route: Provider, transport: RemoteTransport) => RerankProvider;
+export type ProviderFactory = (model: ValidatedDecisionModel, transport: RemoteTransport) => RerankProvider;

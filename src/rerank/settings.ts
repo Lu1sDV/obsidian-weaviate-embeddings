@@ -1,7 +1,7 @@
+import { adaptiveLimits } from "./adaptive-plan";
 import { Setting } from "obsidian";
 import type { RerankService } from "./service";
 import type { RerankStore } from "./store";
-import { PROVIDERS, REASON_LABELS } from "./types";
 
 /** All values here, including consent, are device-local rather than vault-synced. */
 export function renderRerankSettings(
@@ -12,38 +12,25 @@ export function renderRerankSettings(
   refresh: () => void,
 ): void {
   const access = store.access();
-  const providerName = access.provider === "openrouter" ? "OpenRouter (routing to TypeSafe)" : "TypeSafe directly";
+  const providerName = "OpenRouter and the selected model's provider";
 
-  root.createEl("h2", { text: "Optional JEV cloud reranking" });
+  root.createEl("h2", { text: "Optional System One reranking" });
   root.createEl("p", {
-    text: "Search only, off by default. Embeddings and Weaviate stay local. A manual action sends the query and selected title/heading/excerpts to the chosen provider. Sent text cannot be recalled. Keys, cloud policy, and provider consent are device-local and outside the vault. File permissions are access control, not encryption.",
+    text: "Off by default. Embeddings and Weaviate stay local. Manual Search or Connections reranking may send the source note or selected passage and complete or extracted candidate notes to the chosen provider. Image destinations are removed; meaningful captions can remain. Linked notes and attachments are never expanded. Sent text cannot be recalled. Keys, cloud policy, and provider consent are device-local and outside the vault. File permissions are access control, not encryption.",
     cls: "setting-item-description",
   });
 
   new Setting(root)
-    .setName("Enable manual JEV reranking")
-    .setDesc("Adds the Search action; never uploads while typing, opening a note, or using Connections. No index rebuild.")
+    .setName("Enable manual reranking")
+    .setDesc("Adds manual actions in Search and Connections. Enabling, typing and opening notes send nothing. No index rebuild.")
     .addToggle(toggle => toggle.setValue(access.enabled).onChange(enabled => run(async () => {
       await store.configure({ enabled });
       refresh();
     })));
 
   new Setting(root)
-    .setName("JEV provider")
-    .setDesc("Pinned requested model; no silent failover to another processor.")
-    .addDropdown(dropdown => dropdown
-      .addOption("openrouter", "OpenRouter — typesafe/jev-1.13")
-      .addOption("typesafe", "TypeSafe — jev-1.13.0")
-      .setValue(access.provider)
-      .onChange(provider => run(async () => {
-        if (provider !== "openrouter" && provider !== "typesafe") return;
-        await store.configure({ provider });
-        refresh();
-      })));
-
-  new Setting(root)
-    .setName(`Allow query and excerpt uploads to ${providerName}`)
-    .setDesc("Separate consent for this provider and device. Disabling immediately cancels future requests and clears cached judgments; it cannot recall earlier uploads.")
+    .setName(`Allow source and candidate text uploads to ${providerName}`)
+    .setDesc("Changing the model resets this permission because its upstream processor may change. Disabling cancels future requests and clears cached judgments.")
     .addToggle(toggle => toggle.setValue(access.consent).onChange(approved => run(async () => {
       await store.setConsent(access.provider, approved);
       refresh();
@@ -51,14 +38,14 @@ export function renderRerankSettings(
 
   let newKey = "";
   const credential = new Setting(root)
-    .setName("JEV API key")
+    .setName("OpenRouter API key")
     .setDesc(access.apiKey
       ? "A key is saved outside this vault. Enter a replacement or clear it explicitly."
       : "No key saved. Credentials are isolated in device-local rerank-credentials.json, never plugin data.json.");
   credential.addText(input => {
     input.inputEl.type = "password";
     input.inputEl.autocomplete = "off";
-    input.setPlaceholder("Provider API key").onChange(value => { newKey = value; });
+    input.setPlaceholder("OpenRouter API key").onChange(value => { newKey = value; });
   }).addButton(button => button.setButtonText("Save key").onClick(() => run(async () => {
     if (!newKey.trim()) throw new Error("Enter a key, or use Clear key to remove the saved credential");
     await store.setKey(access.provider, newKey);
@@ -69,20 +56,36 @@ export function renderRerankSettings(
     refresh();
   })));
 
+  let newModel = access.model;
+  new Setting(root)
+    .setName("OpenRouter decision model")
+    .setDesc("Enter an exact author/model ID or ~author/alias. The model must accept text and return typed Decisions answers. Chat models are not compatible.")
+    .addText(input => input.setValue(newModel).setPlaceholder("typesafe/jev-1.14").onChange(value => { newModel = value; }));
+
   const check = new Setting(root)
-    .setName("Synthetic connection test")
-    .setDesc(`Sends built-in arithmetic text only to ${providerName}; no query or vault content. Requested model: ${PROVIDERS[access.provider].model}.`);
-  check.addButton(button => button.setButtonText("Test JEV").setDisabled(!access.apiKey).onClick(() => run(async () => {
+    .setName("Validate selected model")
+    .setDesc(service.validationProblem
+      ? `Last validation failed: ${service.validationProblem}. Save a compatible model and validate again.`
+      : "Checks the available Decisions catalogue, then sends built-in arithmetic with the real reranking request shape. No vault content is sent. This small API call may incur a charge. Validate once per plugin session, after a model/key change, or after 24 hours.");
+  check.addButton(button => button.setButtonText("Save & validate").setDisabled(!access.apiKey).onClick(() => run(async () => {
     button.setDisabled(true);
     try {
-      const result = await service.testConnection(new AbortController().signal);
-      check.setDesc(result.status === "applied"
-        ? `Synthetic contract passed: ${result.metrics.servedModel ?? "unknown serving revision"}. This does not measure vault ranking quality.`
-        : `Synthetic test failed: ${REASON_LABELS[result.reason]}.`);
+      if (!newModel.trim()) throw new Error("Enter an OpenRouter decision model ID first");
+      await store.configure({ model: newModel });
+      await service.testConnection(new AbortController().signal);
+      refresh();
     } finally {
       button.setDisabled(false);
     }
   })));
+
+  const model = service.validatedModel;
+  if (model) {
+    root.createEl("p", {
+      text: `Validated: ${model.requestedModel} → ${model.canonicalSlug}. Catalogue context: ${model.contextTokens.toLocaleString()} tokens. One-request planning uses ~${adaptiveLimits(model, access).tokens.toLocaleString()} input tokens under conservative byte guards and applicable per-question limits. This is an estimate, not an exact tokenizer count. ${model.fullTextWarning ?? "The synthetic check confirms the request contract, not ranking quality or full-document coverage."}`,
+      cls: "setting-item-description",
+    });
+  }
 
   let folders = access.excludedFolders.map(path => path || "/").join("\n");
   let files = access.excludedFiles.join("\n");
@@ -96,7 +99,7 @@ export function renderRerankSettings(
     .addTextArea(input => input.setValue(files).onChange(value => { files = value; }));
   new Setting(root)
     .setName("Apply remote exclusions")
-    .setDesc("Any restricted candidate skips the entire rerank; private notes are never hidden or demoted in local results.")
+    .setDesc("Any restricted source or requested candidate skips the entire rerank; private notes are never hidden or demoted in local results.")
     .addButton(button => button.setButtonText("Apply remote exclusions").onClick(() => run(async () => {
       await store.configure({
         excludedFolders: folders.split("\n").map(value => value.trim()).filter(Boolean),
@@ -105,21 +108,27 @@ export function renderRerankSettings(
       refresh();
     })));
 
-  new Setting(root)
-    .setName("Evidence passages per note")
-    .setDesc("One is the release default. Two is an explicit experiment with more disclosure, cost, and max-score length bias. Two-passage planning keeps the same candidate cohort chosen by the one-passage policy; if that exact cohort cannot fit the experimental budget, reranking is skipped rather than narrowed.")
-    .addDropdown(dropdown => dropdown
-      .addOption("1", "1 — release default")
-      .addOption("2", "2 — experimental")
-      .setValue(String(access.evidencePassages))
-      .onChange(value => run(async () => {
-        if (value !== "1" && value !== "2") return;
-        await store.configure({ evidencePassages: Number(value) as 1 | 2 });
-        refresh();
-      })));
-
+  let candidateCount = String(access.candidateCount), tokenBudget = String(access.tokenBudget);
+  let contextTokens = String(access.contextTokens), contextMode = access.contextMode, policy = access.evidencePolicy;
+  new Setting(root).setName("Desired candidates").setDesc("1–60. The largest leading candidate set that fits useful evidence in one request is judged; at most 30 are displayed.")
+    .addText(input => input.setValue(candidateCount).onChange(value => { candidateCount = value; }));
+  new Setting(root).setName("Evidence policy").setDesc("Auto uses full cleaned text when affordable, otherwise opening/ending and relevant interior extracts. Complete notes only reduces candidate count without shortening candidate notes.")
+    .addDropdown(input => input.addOption("adaptive", "Auto excerpts").addOption("complete", "Complete notes only").setValue(policy)
+      .onChange(value => { if (value === "adaptive" || value === "complete") policy = value; }));
+  new Setting(root).setName("Total request token cap").setDesc("2,048–262,144; default 64,000. Includes source, all candidates and framing. Model limits and conservative byte guards may lower the usable budget substantially. Planning is estimated, not exact tokenization.")
+    .addText(input => input.setValue(tokenBudget).onChange(value => { tokenBudget = value; }));
+  new Setting(root).setName("Surrounding context").setDesc("Auto expands toward 2,048 tokens per side as space permits. Manual uses the preferred per-side ceiling. Multiple anchors share each note's total allowance.")
+    .addDropdown(input => input.addOption("auto", "Auto").addOption("manual", "Manual ceiling").setValue(contextMode)
+      .onChange(value => { if (value === "auto" || value === "manual") contextMode = value; }));
+  new Setting(root).setName("Preferred tokens per side").setDesc("128–8,192; default 512. Context may shrink under the total budget. A selected source passage itself is never silently shortened.")
+    .addText(input => input.setValue(contextTokens).onChange(value => { contextTokens = value; }));
+  new Setting(root).setName("Apply context settings").addButton(button => button.setButtonText("Apply").onClick(() => run(async () => {
+    await store.configure({ candidateCount: Number(candidateCount), tokenBudget: Number(tokenBudget),
+      contextTokens: Number(contextTokens), contextMode, evidencePolicy: policy });
+    refresh();
+  })));
   root.createEl("p", {
-    text: "Limits: up to 60 admitted notes, 30 displayed notes, up to 24 independent candidate-local questions per packed request, two concurrent requests, a 2.5-second remote deadline, and no retries. One-passage planning uses at most 3 batches / 64k estimated tokens. The two-passage experiment uses at most 6 batches / 128k estimated tokens and must keep the same candidate cohort chosen by one-passage planning; otherwise the exact local ranking stays visible. Publication requires complete compatible judgments. The judgment cache is RAM-only with a 15-minute TTL.",
+    text: "At most one inference request per rerank; no overflow batches, automatic retry, or client-side provider fallback. Preparation and publication have a 30-second action deadline; remote work has at most 20 seconds within it. All judgments must validate before publication. Original cosine/hybrid scores stay visible, but are neither sent to the judge nor blended with relevance. The RAM-only scalar cache expires after 15 minutes. Evidence previews are local and cleared on source/settings changes.",
     cls: "setting-item-description",
   });
 }
