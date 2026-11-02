@@ -1,4 +1,4 @@
-import { ItemView, Keymap, Menu, TFile, WorkspaceLeaf } from "obsidian";
+import { ItemView, Keymap, Menu, TFile, WorkspaceLeaf, parseYaml } from "obsidian";
 import { EmbeddingClient } from "./embeddings";
 import type { PathPolicy } from "./exclusions";
 import { buildConnectionGraph, buildSimilarityGraph, visibleResults, type SimilarityGraphData } from "./graph";
@@ -6,7 +6,8 @@ import { SearchRetrievalService } from "./search/retrieval-service";
 import { remoteNoteAllowed } from "./rerank/policy";
 import type { RerankService } from "./rerank/service";
 import type { RerankStore } from "./rerank/store";
-import { REASON_LABELS, type RerankMetrics } from "./rerank/types";
+import { REASON_LABELS, RerankError, type RerankMetrics, type RerankPreview } from "./rerank/types";
+import { verifyDocument, documentForCandidate, groupConnectionCandidates, HYDRATION_BYTES, DOCUMENT_BYTES, type RerankTarget, type VerifiedDocument } from "./rerank/documents";
 import { shouldClearAfterRerankInvalidation } from "./rerank/view-state";
 import { admissionFor, canonicalInput } from "./policy";
 import { stripFrontmatter } from "./policy-core";
@@ -22,12 +23,13 @@ interface PassageTarget { noteId: string; snapshotId: string; passage: Passage; 
 interface ModeMemory { filters: PropertyFilter[]; expanded: Map<string, string>; scroll: number }
 interface QueryContext { epoch: number; mode: Mode; generation: number; fingerprint: string; anchor?: SearchResult; targetPassageId?: string }
 interface SearchSeed {
-  context: QueryContext; query: string; filters: PropertyFilter[]; vector: number[]; window: HybridWindow;
+  context: QueryContext; query: string; filters: PropertyFilter[]; vector?: number[]; window?: HybridWindow;
+  candidates?: readonly SearchResult[]; candidateWindow?: number;
   baseline: SearchResult[]; graph: SimilarityGraphData | undefined; graphFailed: boolean; exhausted: boolean;
 }
 interface PendingRanking {
   results: SearchResult[]; graph: SimilarityGraphData | undefined; graphFailed: boolean;
-  metrics: RerankMetrics; current: () => boolean;
+  metrics: RerankMetrics; preview?: RerankPreview; current: () => boolean;
 }
 interface FilterControls { updateFields: () => void; updatePresets: () => void; updateChips: () => void }
 const OPERATOR_LABELS: Record<PropertyFilter["operator"], string> = {
@@ -67,6 +69,9 @@ export class SemanticSearchView extends ItemView {
   private changingRerankEnabled = false;
   private applyRerankButton!: HTMLButtonElement;
   private rerankStatus!: HTMLElement;
+  private rerankPreviewEl!: HTMLElement;
+  private rerankCountInput!: HTMLInputElement;
+  private rerankPolicySelect!: HTMLSelectElement;
   private readonly passageRequests = new Map<string, Promise<SearchResult["passages"]>>();
   private readonly searchRetrieval: SearchRetrievalService;
   private readonly memory: Record<Mode, ModeMemory> = {
@@ -130,8 +135,8 @@ export class SemanticSearchView extends ItemView {
   }
 
   invalidate(noteId?: string): void {
-    const rerankAffected = !noteId || this.rerankCandidates.some(candidate => candidate.result.noteId === noteId)
-      || Boolean(this.searchSeed?.window.notes.some(candidate => candidate.result.noteId === noteId));
+    const rerankAffected = !noteId || this.searchSeed?.context.anchor?.noteId === noteId || this.rerankCandidates.some(candidate => candidate.result.noteId === noteId)
+      || Boolean(this.searchSeed?.window?.notes.some(candidate => candidate.result.noteId === noteId));
     const baselineRestoreRequired = rerankAffected && this.reranked;
     let baselineRestored = !baselineRestoreRequired;
     if (rerankAffected) {
@@ -221,18 +226,29 @@ export class SemanticSearchView extends ItemView {
           // Cancel publication now, not when the debounce expires.
           this.requestRefresh(250);
         });
-        this.rerankEnabledButton = controls.createEl("button", { attr: { "aria-label": "Enable manual reranking", "aria-pressed": "false" } });
-        this.rerankEnabledButton.addEventListener("click", () => void this.toggleReranking());
-        this.rerankButton = controls.createEl("button", { text: "Rerank with System One", attr: { "aria-label": "Rerank Search with the configured OpenRouter model" } });
-        this.rerankButton.addEventListener("click", () => void this.rerankSearch());
-        this.applyRerankButton = controls.createEl("button", { text: "Apply reranked order" });
-        this.applyRerankButton.hidden = true;
-        this.applyRerankButton.addEventListener("click", () => this.applyPendingRanking());
-        this.rerankStatus = panel.createDiv({ cls: "local-semantic-muted", attr: { role: "status" } });
-        this.updateRerankControls();
+
       }
       this.filterControls.set(mode, this.buildFilters(panel, mode));
     }
+    const rerankControls = root.createDiv({ cls: "local-semantic-controls" });
+    this.rerankEnabledButton = rerankControls.createEl("button", { attr: { "aria-label": "Enable manual reranking", "aria-pressed": "false" } });
+    this.rerankEnabledButton.addEventListener("click", () => void this.toggleReranking());
+    this.rerankButton = rerankControls.createEl("button", { text: "Rerank with System One" });
+    this.rerankButton.addEventListener("click", () => void this.rerankSearch());
+    this.applyRerankButton = rerankControls.createEl("button", { text: "Apply reranked order" });
+    this.applyRerankButton.hidden = true;
+    this.applyRerankButton.addEventListener("click", () => this.applyPendingRanking());
+    const countLabel = rerankControls.createEl("label", { text: "Candidates " });
+    this.rerankCountInput = countLabel.createEl("input", { type: "number", attr: { min: "1", max: "60", step: "1", "aria-label": "Desired reranking candidate count" } });
+    this.rerankCountInput.addEventListener("change", () => void this.saveRerankControls());
+    const policyLabel = rerankControls.createEl("label", { text: "Context " });
+    this.rerankPolicySelect = policyLabel.createEl("select", { attr: { "aria-label": "Reranking evidence policy" } });
+    this.rerankPolicySelect.createEl("option", { value: "adaptive", text: "Auto excerpts" });
+    this.rerankPolicySelect.createEl("option", { value: "complete", text: "Complete notes only" });
+    this.rerankPolicySelect.addEventListener("change", () => void this.saveRerankControls());
+    this.rerankStatus = root.createDiv({ cls: "local-semantic-muted", attr: { role: "status" } });
+    this.rerankPreviewEl = root.createDiv({ cls: "local-semantic-evidence-preview" });
+    this.updateRerankControls();
     this.statusEl = root.createDiv({ cls: "local-semantic-status", text: this.serviceStatus, attr: { role: "status" } });
     this.resultStatusEl = root.createDiv({ cls: "local-semantic-result-status", attr: { role: "status" } });
     this.scrollEl = root.createDiv({ cls: "local-semantic-surface" });
@@ -448,7 +464,7 @@ export class SemanticSearchView extends ItemView {
 
   /** Keep a current manual ranking stable while unrelated notes finish indexing. */
   private retainsRerankSnapshot(): boolean {
-    return this.mode === "search" && !!this.searchSeed && this.displayCurrent(this.searchSeed.context)
+    return !!this.searchSeed && this.displayCurrent(this.searchSeed.context)
       && (!!this.rerankJob || !!this.pendingRanking || this.reranked);
   }
 
@@ -581,11 +597,13 @@ export class SemanticSearchView extends ItemView {
       let results: SearchResult[] = [];
       let exhausted = false;
       let searchWindow: HybridWindow | undefined;
+      let connectionWindow = 90;
       // Each window replaces the prior hybrid ranking: fusion scores are window-local.
       const budgets = mode === "connections" ? [90, 300, 1200] : [300, 600, 1200];
       for (const limit of budgets) {
         if (!this.contextCurrent(context)) return;
         if (context.anchor) {
+          connectionWindow = limit;
           candidates = context.targetPassageId
             ? await this.weaviate.connectionsForPassage(generation, context.fingerprint, context.anchor.noteId, context.anchor.snapshotId, context.targetPassageId, filters, this.registry, limit)
             : await this.weaviate.connectionsForNote(generation, context.fingerprint, context.anchor.noteId, context.anchor.snapshotId, filters, this.registry, limit);
@@ -645,6 +663,11 @@ export class SemanticSearchView extends ItemView {
           baseline: structuredClone(results), graph: graphData, graphFailed, exhausted };
         this.rerankStatus.setText("Local hybrid results");
         this.updateRerankControls();
+      } else if (mode === "connections") {
+        this.searchSeed = { context, query: "", filters, candidates: structuredClone(candidates), candidateWindow: connectionWindow,
+          baseline: structuredClone(results), graph: graphData, graphFailed, exhausted };
+        this.rerankStatus.setText("Local cosine results");
+        this.updateRerankControls();
       }
     } catch {
       if (!stillCurrent()) return;
@@ -657,8 +680,10 @@ export class SemanticSearchView extends ItemView {
   /** Configuration changes revoke remote work, not the local index or its fingerprints. */
   rerankSettingsChanged(): void {
     this.cancelRerank();
-    if (this.reranked && this.searchSeed) this.publishRanking(this.searchSeed.baseline, this.searchSeed.graph, this.searchSeed.graphFailed, false);
-    this.rerankStatus?.setText("Local results retained — remote settings changed");
+    if (this.reranked && (!this.searchSeed || !this.publishRanking(this.searchSeed.baseline, this.searchSeed.graph, this.searchSeed.graphFailed, false))) {
+      this.cancelRequests(); this.clearVisible(); this.needsRefresh = true;
+      this.rerankStatus?.setText("Stale reranked results cleared — local baseline changed");
+    } else this.rerankStatus?.setText("Local results retained — remote settings changed");
     this.updateRerankControls();
     this.scheduleIndexRefresh();
   }
@@ -668,12 +693,15 @@ export class SemanticSearchView extends ItemView {
     this.rerankJob = undefined;
     this.rerankCandidates = [];
     this.pendingRanking = undefined;
+    this.rerankPreviewEl?.replaceChildren();
     if (this.applyRerankButton) this.applyRerankButton.hidden = true;
   }
 
   private updateRerankControls(): void {
     if (!this.rerankButton) return;
     const access = this.rerankStore?.access();
+    if (this.rerankCountInput) { this.rerankCountInput.value = String(access?.candidateCount ?? 30); this.rerankCountInput.disabled = !this.rerankStore; }
+    if (this.rerankPolicySelect) { this.rerankPolicySelect.value = access?.evidencePolicy ?? "adaptive"; this.rerankPolicySelect.disabled = !this.rerankStore; }
     if (this.rerankEnabledButton) {
       this.rerankEnabledButton.setText(access?.enabled ? "Reranking on" : "Reranking off");
       this.rerankEnabledButton.setAttribute("aria-pressed", String(access?.enabled === true));
@@ -689,7 +717,18 @@ export class SemanticSearchView extends ItemView {
       : this.pendingRanking || this.reranked ? "Keep the original local ranking"
       : !access?.enabled ? "Turn reranking on here, then configure its model, key, and upload permission in plugin settings"
       : !this.reranker?.validatedModel ? "Validate the selected OpenRouter model in plugin settings before reranking"
-      : "Query text and permitted excerpts will be sent to the configured OpenRouter model";
+      : "The current source and permitted candidate text will be sent to the configured OpenRouter model";
+  }
+
+  private async saveRerankControls(): Promise<void> {
+    if (!this.rerankStore) return;
+    try {
+      const candidateCount = Number(this.rerankCountInput.value), policy = this.rerankPolicySelect.value;
+      if (!Number.isSafeInteger(candidateCount) || candidateCount < 1 || candidateCount > 60
+        || policy !== "adaptive" && policy !== "complete") throw new Error("Invalid controls");
+      await this.rerankStore.configure({ candidateCount, evidencePolicy: policy });
+    } catch { this.rerankStatus.setText("Use 1–60 candidates. The one-request budget may admit fewer."); }
+    finally { this.updateRerankControls(); }
   }
 
   private async toggleReranking(): Promise<void> {
@@ -721,95 +760,173 @@ export class SemanticSearchView extends ItemView {
   /** Deliberately outside runQueries(): obsolete cloud work cannot block a new local query. */
   private async rerankSearch(): Promise<void> {
     if (this.rerankJob) {
-      this.cancelRerank();
-      this.updateRerankControls();
-      this.rerankStatus.setText("Reranking cancelled — local results retained");
-      this.scheduleIndexRefresh();
-      return;
+      this.cancelRerank(); this.updateRerankControls();
+      this.rerankStatus.setText("Reranking cancelled — local results retained"); this.scheduleIndexRefresh(); return;
     }
     const seed = this.searchSeed;
     if (!seed || !this.reranker || !this.rerankStore || !this.displayCurrent(seed.context)) return;
     if (this.pendingRanking) {
-      this.cancelRerank(); this.updateRerankControls(); this.rerankStatus.setText("Local hybrid results");
-      this.scheduleIndexRefresh(); return;
+      this.cancelRerank(); this.updateRerankControls(); this.rerankStatus.setText("Local results retained"); this.scheduleIndexRefresh(); return;
     }
     if (this.reranked) {
-      this.publishRanking(seed.baseline, seed.graph, seed.graphFailed, false);
-      this.rerankStatus.setText("Local hybrid results");
+      const restored = this.publishRanking(seed.baseline, seed.graph, seed.graphFailed, false);
+      if (!restored) { this.cancelRequests(); this.clearVisible(); this.needsRefresh = true; }
+      this.rerankPreviewEl?.replaceChildren();
+      this.rerankStatus.setText(restored ? "Local results retained" : "Stale reranked results cleared — local baseline changed");
       this.scheduleIndexRefresh(); return;
     }
     const access = this.rerankStore.access();
     const unavailable = !access.enabled ? "off" : !access.apiKey ? "unconfigured" : !access.consent ? "policy" : undefined;
     if (unavailable) { this.rerankStatus.setText(`Local results retained — ${REASON_LABELS[unavailable]}`); return; }
     if (!this.reranker.validatedModel) {
-      this.rerankStatus.setText("Local results retained — validate the selected OpenRouter model in plugin settings");
-      return;
+      this.rerankStatus.setText("Local results retained — validate the selected OpenRouter model in plugin settings"); return;
     }
-    const job = new AbortController();
+    const job = new AbortController(), deadlineAt = performance.now() + 30_000;
+    const timeout = window.setTimeout(() => job.abort(new RerankError("deadline")), 30_000);
     this.rerankJob = job;
-    this.rerankCandidates = seed.window.notes;
+    this.rerankCandidates = seed.window?.notes ?? groupConnectionCandidates((seed.candidates ?? []).filter(result => this.resultCurrent(result, seed.context)), access.candidateCount);
     const interaction = this.interactionEpoch;
-    const current = () => !job.signal.aborted && this.searchSeed === seed && this.contextCurrent(seed.context)
-      && this.query === seed.query && canonicalJson(this.memory.search.filters) === canonicalJson(seed.filters)
+    const stamps: Array<{ file: TFile; mtime: number; size: number }> = [];
+    const current = () => !job.signal.aborted && this.searchSeed === seed
+      && this.contextCurrent(seed.context) && (seed.context.mode !== "search" || this.query === seed.query)
+      && canonicalJson(this.memory[seed.context.mode].filters) === canonicalJson(seed.filters)
       && this.rerankStore!.access().revision === access.revision
-      && seed.baseline.every(result => this.resultCurrent(result, seed.context));
-    this.updateRerankControls();
-    this.rerankStatus.setText("Preparing reranking evidence; local results remain available…");
+      && seed.baseline.every(result => this.resultCurrent(result, seed.context))
+      && stamps.every(stamp => stamp.file.stat.mtime === stamp.mtime && stamp.file.stat.size === stamp.size);
+    const sourceAllowed = () => !seed.context.anchor || this.remoteAllowed(seed.context.anchor, seed.context);
+    const guard = () => {
+      if (job.signal.aborted) throw job.signal.reason instanceof RerankError ? job.signal.reason : new RerankError("cancelled");
+      if (performance.now() >= deadlineAt) throw new RerankError("deadline");
+      if (!current()) throw new RerankError("snapshot");
+      if (!sourceAllowed() || !this.rerankCandidates.every(candidate => this.remoteAllowed(candidate.result, seed.context))) throw new RerankError("policy");
+    };
+    this.updateRerankControls(); this.rerankStatus.setText("Preparing verified source and candidate text locally…");
     try {
-      const expansion = await this.searchRetrieval.expand(seed.window, {
-        generation: seed.context.generation,
-        fingerprint: seed.context.fingerprint,
-        query: seed.query,
-        vector: seed.vector,
-        filters: seed.filters,
-      }, result => this.resultCurrent(result, seed.context), current);
-      if (!expansion || !current()) return;
-      const pool = expansion.candidates;
+      let pool: readonly RetrievedNoteCandidate[], candidateWindow: number, exhausted: boolean;
+      if (seed.window && seed.vector) {
+        const expansion = await this.searchRetrieval.expand(seed.window, {
+          generation: seed.context.generation, fingerprint: seed.context.fingerprint,
+          query: seed.query, vector: seed.vector, filters: seed.filters,
+        }, result => this.resultCurrent(result, seed.context), current, access.candidateCount);
+        if (!expansion || !current()) return;
+        pool = expansion.candidates.slice(0, access.candidateCount); candidateWindow = expansion.window.limit; exhausted = expansion.candidateExhausted;
+      } else {
+        let candidates = seed.candidates ?? [];
+        pool = groupConnectionCandidates(candidates.filter(result => this.resultCurrent(result, seed.context)), access.candidateCount);
+        candidateWindow = seed.candidateWindow ?? 90; exhausted = pool.length < access.candidateCount;
+        const anchor = seed.context.anchor;
+        if (!anchor) throw new RerankError("snapshot");
+        for (const limit of [300, 1200]) {
+          if (limit <= candidateWindow) continue;
+          if (pool.length >= access.candidateCount || candidates.length < candidateWindow) break;
+          guard();
+          candidates = seed.context.targetPassageId
+            ? await this.weaviate.connectionsForPassage(seed.context.generation, seed.context.fingerprint, anchor.noteId, anchor.snapshotId,
+              seed.context.targetPassageId, seed.filters, this.registry, limit)
+            : await this.weaviate.connectionsForNote(seed.context.generation, seed.context.fingerprint, anchor.noteId, anchor.snapshotId, seed.filters, this.registry, limit);
+          pool = groupConnectionCandidates(candidates.filter(result => this.resultCurrent(result, seed.context)), access.candidateCount);
+          candidateWindow = limit;
+        }
+        exhausted = pool.length < access.candidateCount;
+      }
       this.rerankCandidates = pool;
-      const snapshotsCurrent = () => current() && pool.every(candidate => this.resultCurrent(candidate.result, seed.context));
-      const allowed = () => snapshotsCurrent() && pool.every(candidate => this.remoteAllowed(candidate.result, seed.context));
-      this.rerankStatus.setText("Reranking with System One; local results remain available…");
+      guard();
+      let hydratedBytes = 0;
+      const load = async (result: SearchResult): Promise<VerifiedDocument> => {
+        guard();
+        const note = this.state.notes[result.noteId];
+        const file = this.app.vault.getAbstractFileByPath(result.path);
+        if (!note || !(file instanceof TFile) || file.stat.size > DOCUMENT_BYTES) throw new RerankError("snapshot");
+        const manifest = structuredClone(note);
+        stamps.push({ file, mtime: file.stat.mtime, size: file.stat.size });
+        const [markdown, stored] = await Promise.all([
+          this.app.vault.read(file),
+          this.weaviate.loadSnapshot(seed.context.generation, result.noteId, result.snapshotId, seed.context.fingerprint, manifest.passageIds),
+        ]);
+        guard();
+        // MetadataCache can lag a frontmatter edit. Authorize the fresh read too, before upload.
+        const raw = markdown.startsWith("\uFEFF") ? markdown.slice(1) : markdown;
+        const body = stripFrontmatter(raw);
+        let frontmatter: Record<string, unknown> = {};
+        if (body !== raw) {
+          const prefix = raw.slice(raw.indexOf("\n") + 1, raw.length - body.length).replace(/---[ \t]*(?:\r?\n)?$/, "");
+          const parsed: unknown = parseYaml(prefix);
+          if (parsed != null && (typeof parsed !== "object" || Array.isArray(parsed))) throw new RerankError("policy");
+          frontmatter = (parsed ?? {}) as Record<string, unknown>;
+        }
+        const metadata = this.app.metadataCache.getFileCache(file);
+        if (!metadata || !remoteNoteAllowed(this.rerankStore!.settings, result.path, { frontmatter })
+          || !admissionFor(file, { ...metadata, frontmatter }, this.pathPolicy).admitted) throw new RerankError("policy");
+        const properties = await new PropertyRegistry().normalize(frontmatter);
+        guard();
+        if (properties.frontmatterJson !== stored.note.properties.frontmatterJson) throw new RerankError("snapshot");
+        const canonical = canonicalInput(file, markdown);
+        hydratedBytes += Buffer.byteLength(canonical);
+        if (hydratedBytes > HYDRATION_BYTES) throw new RerankError("budget");
+        const verified = verifyDocument(manifest, canonical, stored);
+        if (!this.resultCurrent(result, seed.context)) throw new RerankError("snapshot");
+        return verified;
+      };
+      let source: RerankTarget = { kind: "search", title: "", text: seed.query, anchors: [] };
+      let queryVector: readonly number[] | undefined = seed.vector;
+      if (seed.context.anchor) {
+        const document = await load(seed.context.anchor);
+        source = { kind: "note", title: document.title, text: document.text, anchors: [],
+          noteId: document.noteId, snapshotId: document.snapshotId };
+        queryVector = document.vector;
+        if (seed.context.targetPassageId) {
+          const passage = document.passages.find(item => item.passageId === seed.context.targetPassageId);
+          if (!passage) throw new RerankError("snapshot");
+          source.kind = "passage"; source.selected = { start: passage.start, end: passage.end, passageId: passage.passageId, heading: passage.heading };
+          queryVector = passage.vector;
+        }
+      }
+      const documents = [];
+      for (const candidate of pool) {
+        const verified = await load(candidate.result);
+        documents.push(documentForCandidate(verified, candidate, queryVector));
+        // Yield between hydrated notes so local interaction and cancellation remain responsive.
+        await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+      }
+      const allowed = () => current() && sourceAllowed() && pool.every(candidate => this.remoteAllowed(candidate.result, seed.context));
+      guard();
+      this.rerankStatus.setText("Reranking in one request; local results remain available…");
       const outcome = await this.reranker.run({
-        vaultId: this.state.vaultId,
-        generation: seed.context.generation,
-        fingerprint: seed.context.fingerprint,
-        query: seed.query,
-        queryEpoch: seed.context.epoch,
-        filtersIdentity: canonicalJson(seed.filters),
-        candidates: pool,
-        minimumCandidateCount: Math.max(1, seed.baseline.length),
-        baselineWindow: seed.window.limit,
-        candidateWindow: expansion.window.limit,
-        candidateExhausted: expansion.candidateExhausted,
-        signal: job.signal,
-        isCurrent: snapshotsCurrent,
+        source, documents, isSourceAllowed: sourceAllowed, deadlineAt,
+        vaultId: this.state.vaultId, generation: seed.context.generation, fingerprint: seed.context.fingerprint,
+        query: seed.query, queryEpoch: seed.context.epoch, filtersIdentity: canonicalJson(seed.filters), candidates: pool,
+        minimumCandidateCount: 1, baselineWindow: seed.window?.limit ?? seed.candidateWindow ?? 90, candidateWindow, candidateExhausted: exhausted,
+        signal: job.signal, isCurrent: () => current() && pool.every(candidate => this.resultCurrent(candidate.result, seed.context)),
         isAllowed: candidate => this.remoteAllowed(candidate.result, seed.context),
       });
       if (!current()) return;
-      if (outcome.status !== "applied") {
-        this.rerankStatus.setText(`Local results retained — ${REASON_LABELS[outcome.reason]}`); return;
-      }
-      if (!allowed()) { this.rerankStatus.setText("Local results retained — candidate snapshots or permissions changed"); return; }
+      if (outcome.status !== "applied") { this.rerankStatus.setText(`Local results retained — ${REASON_LABELS[outcome.reason]}`); return; }
+      if (!allowed()) throw new RerankError("policy");
       let graph: SimilarityGraphData | undefined, graphFailed = false;
       try {
-        const vectors = await this.weaviate.noteVectors(seed.context.generation, seed.context.fingerprint,
-          outcome.results.map(({ noteId, snapshotId }) => ({ noteId, snapshotId })));
-        if (!allowed()) return;
-        graph = buildSimilarityGraph(outcome.results, undefined, vectors, this.embeddings.profile.dimensions);
+        if (seed.context.anchor) graph = buildConnectionGraph(outcome.results, seed.context.anchor);
+        else {
+          const vectors = await this.weaviate.noteVectors(seed.context.generation, seed.context.fingerprint,
+            outcome.results.map(({ noteId, snapshotId }) => ({ noteId, snapshotId })));
+          graph = buildSimilarityGraph(outcome.results, undefined, vectors, this.embeddings.profile.dimensions);
+        }
       } catch { graphFailed = true; }
       if (!allowed()) return;
-      this.pendingRanking = { results: outcome.results, graph, graphFailed, metrics: outcome.metrics, current: allowed };
+      guard();
+      this.pendingRanking = { results: outcome.results, graph, graphFailed, metrics: outcome.metrics, current: allowed,
+        ...(outcome.preview ? { preview: outcome.preview } : {}) };
       if (interaction !== this.interactionEpoch || this.scrollEl.contains(this.contentEl.ownerDocument.activeElement)) {
         this.applyRerankButton.hidden = false;
         this.rerankStatus.setText("Reranked order ready — apply when you have finished inspecting local results");
       } else this.applyPendingRanking();
-    } catch {
-      if (current()) this.rerankStatus.setText("Local results retained — reranking could not be completed");
+    } catch (error) {
+      if (this.rerankJob === job && this.searchSeed === seed) this.rerankStatus.setText(`Local results retained — ${error instanceof RerankError ? REASON_LABELS[error.reason] : "verified evidence could not be prepared"}`);
     } finally {
+      window.clearTimeout(timeout);
       if (this.rerankJob === job) {
         this.rerankJob = undefined;
-        this.updateRerankControls();
-        this.scheduleIndexRefresh();
+        if (job.signal.reason instanceof RerankError && job.signal.reason.reason === "deadline") this.rerankStatus.setText("Local results retained — reranking timed out");
+        this.updateRerankControls(); this.scheduleIndexRefresh();
       }
     }
   }
@@ -824,15 +941,28 @@ export class SemanticSearchView extends ItemView {
     }
     this.pendingRanking = undefined;
     this.applyRerankButton.hidden = true;
-    this.publishRanking(pending.results, pending.graph, pending.graphFailed, true);
+    if (!this.publishRanking(pending.results, pending.graph, pending.graphFailed, true)) {
+      this.rerankStatus.setText("Local results retained — source snapshots changed"); return;
+    }
     const metrics = pending.metrics;
-    this.rerankStatus.setText(`System One relevance · ${metrics.servedModel ?? metrics.requestedModel} · ${metrics.evidenceCount} passages · ${metrics.cacheHits} cached${metrics.truncatedCount ? ` · ${metrics.truncatedCount} bounded excerpts` : ""}`);
+    this.rerankStatus.setText(`System One relevance · ${metrics.servedModel ?? metrics.requestedModel} · ${metrics.candidateCount}/${metrics.inputCandidateCount} candidates · ${metrics.requests ? "one request" : "cached"} · ${metrics.sourceTruncated ? "source shortened" : "source target complete"} · ${metrics.completeCandidateCount ?? 0} complete / ${metrics.truncatedCount} excerpt candidates · ~${metrics.estimatedTokens}/${metrics.inputTokenBudget ?? "?"} planned tokens${metrics.omittedAnchorCount ? ` · ${metrics.omittedAnchorCount} anchors omitted or shortened` : ""}`);
+    this.rerankPreviewEl?.replaceChildren();
+    if (pending.preview && this.rerankPreviewEl) {
+      const details = this.rerankPreviewEl.createEl("details");
+      details.createEl("summary", { text: "Evidence used (local preview)" });
+      details.createEl("h4", { text: pending.preview.source.title || "Source query" });
+      details.createEl("pre", { text: pending.preview.source.text });
+      for (const candidate of pending.preview.candidates) {
+        details.createEl("h4", { text: `${candidate.title}${candidate.shortened ? " — excerpt" : " — complete cleaned text"}` });
+        details.createEl("pre", { text: candidate.text });
+      }
+    }
   }
 
   private publishRanking(results: readonly SearchResult[], graph: SimilarityGraphData | undefined, graphFailed: boolean, reranked: boolean): boolean {
     const seed = this.searchSeed;
     if (!seed || !this.contextCurrent(seed.context) || !results.every(result => this.resultCurrent(result, seed.context))) return false;
-    this.memory.search.scroll = this.scrollEl.scrollTop;
+    this.memory[seed.context.mode].scroll = this.scrollEl.scrollTop;
     this.results = structuredClone([...results]);
     this.reranked = reranked;
     this.inspectionEpoch++;
@@ -840,7 +970,7 @@ export class SemanticSearchView extends ItemView {
     this.inspectorEl.replaceChildren(); this.inspectorEl.hidden = true;
     this.resultStatusEl.replaceChildren();
     this.resultStatusEl.createEl("strong", { text: `${results.length} notes`, cls: "local-semantic-result-count" });
-    this.resultStatusEl.createEl("strong", { text: reranked ? "Reranked search" : "Hybrid search", cls: "local-semantic-result-mode" });
+    this.resultStatusEl.createEl("strong", { text: reranked ? seed.context.anchor ? "Reranked connections" : "Reranked search" : seed.context.anchor ? "Cosine similarity" : "Hybrid search", cls: "local-semantic-result-mode" });
     if (!reranked && seed.exhausted) this.resultStatusEl.createDiv({ text: "Candidate limit reached; additional admitted matches may exist.", cls: "local-semantic-result-warning" });
     if (graph) this.graph.setData(graph); else this.graph.clear();
     if (graphFailed) this.resultStatusEl.createDiv({ text: "Graph unavailable: stored vectors could not be validated.", cls: "local-semantic-result-warning" });

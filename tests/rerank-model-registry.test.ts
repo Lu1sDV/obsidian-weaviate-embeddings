@@ -28,7 +28,9 @@ function wire(request: RemoteRequest): string {
 function input(): RerankInput {
   const result = { noteId: "one", snapshotId: "snap", path: "One.md", title: "One", score: 0.8,
     scoreKind: "hybrid" as const, passages: [{ passageId: "p1", heading: "", body: "Useful evidence", startLine: 0, endLine: 1 }] };
-  return { vaultId: "test", generation: 1, fingerprint: "test", query: "Useful", queryEpoch: 0,
+  return { source: { kind: "search", title: "", text: "Useful", anchors: [] },
+    documents: [{ title: "One", text: "Useful evidence", anchors: [{ start: 0, end: 15, passageId: "p1" }] }],
+    isSourceAllowed: () => true, vaultId: "test", generation: 1, fingerprint: "test", query: "Useful", queryEpoch: 0,
     filtersIdentity: "[]", minimumCandidateCount: 1, baselineWindow: 300, candidateWindow: 300,
     candidateExhausted: true, signal: new AbortController().signal, isCurrent: () => true, isAllowed: () => true,
     candidates: [{ result, noteRank: 0, passages: [{ ...result.passages[0]!, noteId: "one", snapshotId: "snap",
@@ -104,8 +106,8 @@ test("only a successful synthetic inference enables a catalogue-checked model", 
   const registry = new OpenRouterModelRegistry(async () => ({ data: [entry()] }));
   const service = new RerankService(() => access(), async request => {
     calls++;
-    const body = JSON.parse(request.body) as { state: { query: string } };
-    assert.equal(body.state.query, "What is two plus two?");
+    const body = JSON.parse(request.body) as { state: { source: { segments: Array<{ text: string }> } } };
+    assert.equal(body.state.source.segments[0]?.text, "What is two plus two?");
     assert.ok(!request.body.includes("Useful evidence"));
     return wire(request);
   }, registry);

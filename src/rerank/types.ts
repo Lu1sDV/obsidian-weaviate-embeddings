@@ -1,3 +1,4 @@
+import type { RerankDocument, RerankTarget } from "./documents";
 import type { SearchResult } from "../types";
 import type { RetrievedNoteCandidate } from "../weaviate";
 
@@ -22,13 +23,13 @@ export const LIMITS = Object.freeze({
   twoPassageMaxBatches: 6,
   queryBytes: 4096,
   evidenceBytes: 1536,
-  requestBytes: 48_000,
+  requestBytes: 512_000,
   responseBytes: 64_000,
   requestTargetTokens: 20_000,
   requestTokens: 24_000,
   operationTokens: 64_000,
   twoPassageOperationTokens: 128_000,
-  deadlineMs: 2500,
+  deadlineMs: 20_000,
   cacheEntries: 5000,
   cacheBytes: 1_000_000,
   cacheTtlMs: 15 * 60_000,
@@ -46,7 +47,13 @@ export interface RerankSettings {
   enabled: boolean;
   provider: Provider;
   model: string;
+  /** Legacy setting retained for migration; no longer controls runtime evidence. */
   evidencePassages: 1 | 2;
+  candidateCount: number;
+  tokenBudget: number;
+  evidencePolicy: "adaptive" | "complete";
+  contextMode: "auto" | "manual";
+  contextTokens: number;
   excludedFolders: string[];
   excludedFiles: string[];
 }
@@ -61,13 +68,13 @@ export interface RerankAccess extends RerankSettings {
   apiKey: string;
 }
 export function defaultRerankSettings(): RerankSettings {
-  return { enabled: false, provider: "openrouter", model: "", evidencePassages: 1, excludedFolders: [], excludedFiles: [] };
+  return { enabled: false, provider: "openrouter", model: "", evidencePassages: 1, candidateCount: 30, tokenBudget: 64_000, evidencePolicy: "adaptive", contextMode: "auto", contextTokens: 512, excludedFolders: [], excludedFiles: [] };
 }
 
 export type RerankReason =
   | "off" | "unconfigured" | "policy" | "budget" | "circuit-open" | "deadline"
   | "authentication" | "contract" | "rate-limit" | "provider" | "invalid-response" | "model-change" | "cancelled"
-  | "model-unverified" | "model-invalid" | "credits";
+  | "model-unverified" | "model-invalid" | "credits" | "snapshot" | "source-too-large";
 
 export class RerankError extends Error {
   readonly status: number | undefined;
@@ -77,6 +84,8 @@ export class RerankError extends Error {
   }
 }
 export const REASON_LABELS: Record<RerankReason, string> = {
+  snapshot: "the source no longer matches its indexed snapshot",
+  "source-too-large": "the selected source cannot fit; select a shorter passage or change the budget/model",
   off: "reranking is disabled",
   unconfigured: "configure an OpenRouter key and model in settings",
   "model-unverified": "validate the selected OpenRouter model in settings for this session",
@@ -144,14 +153,24 @@ export interface RerankMetrics {
   outputTokens: number;
   cost: number | null;
   elapsedMs: number;
+  sourceTruncated?: boolean;
+  completeCandidateCount?: number;
+  omittedCandidateCount?: number;
+  omittedAnchorCount?: number;
+  inputTokenBudget?: number;
+  tokenAccounting?: "estimated";
+}
+export interface RerankPreview {
+  source: { title: string; text: string; shortened: boolean };
+  candidates: Array<{ noteId: string; title: string; text: string; shortened: boolean }>;
 }
 export type RerankOutcome =
-  | { status: "applied"; results: SearchResult[]; metrics: RerankMetrics }
+  | { status: "applied"; results: SearchResult[]; metrics: RerankMetrics; preview?: RerankPreview }
   | { status: "retained" | "cancelled"; reason: RerankReason; metrics: RerankMetrics };
 export interface RerankLease {
   sessionId: string;
   queryEpoch: number;
-  mode: "search";
+  mode: "search" | "note" | "passage";
   queryHash: string;
   filtersHash: string;
   generation: number;
@@ -167,6 +186,10 @@ export interface RerankLease {
 }
 
 export interface RerankInput {
+  deadlineAt?: number;
+  source: RerankTarget;
+  documents: readonly RerankDocument[];
+  isSourceAllowed: () => boolean;
   vaultId: string;
   generation: number;
   fingerprint: string;

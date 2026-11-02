@@ -17,7 +17,14 @@ export function validateRerankSettings(raw: unknown): RerankSettings {
   const value = { ...defaultRerankSettings(), ...raw } as Record<string, unknown>;
   if (typeof value.enabled !== "boolean" || value.provider !== "openrouter"
     || (value.evidencePassages !== 1 && value.evidencePassages !== 2)) throw new Error("Invalid rerank settings");
+  for (const [name, min, max] of [["candidateCount", 1, 60], ["tokenBudget", 2048, 262144], ["contextTokens", 128, 8192]] as const) {
+    if (typeof value[name] !== "number" || !Number.isSafeInteger(value[name]) || value[name] < min || value[name] > max) throw new Error(`Invalid ${name}`);
+  }
+  if (value.evidencePolicy !== "adaptive" && value.evidencePolicy !== "complete") throw new Error("Invalid evidence policy");
+  if (value.contextMode !== "auto" && value.contextMode !== "manual") throw new Error("Invalid context mode");
   return {
+    candidateCount: value.candidateCount as number, tokenBudget: value.tokenBudget as number,
+    contextTokens: value.contextTokens as number, evidencePolicy: value.evidencePolicy, contextMode: value.contextMode,
     enabled: value.enabled,
     provider: value.provider,
     model: value.model === "" ? "" : normalizeDecisionModelId(value.model),

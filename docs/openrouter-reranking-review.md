@@ -1,6 +1,6 @@
 # OpenRouter reranking: review and proposed next stage
 
-Review date: 2026-11-02. **The integration/settings/sidebar changes below are implemented in this review branch. Whole-note and passage Connections reranking, including the two proposed evidence modes, remain unimplemented.**
+Review date: 2026-11-02. **The agreed single-request implementation now exists for Search, whole-note Connections and selected-passage Connections. This document preserves the design rationale. For the actual implementation, limits, and completed second-pass review, see [the implementation guide](jev-reranking.md) and [phase-2 review](phase-2-reranking-review.md).**
 
 ## Baseline and findings
 
@@ -72,7 +72,7 @@ For an oversized candidate, allocate most text to relevant interior matches with
 
 “Beginning” means substantive introductory content, after frontmatter, banners or a table of contents. “End” means substantive final material, not automatically a bibliography or attachment list. Such sections remain eligible when they contain the relevant match.
 
-The whole-note Connections query currently returns note-level hits without matched passages. It therefore needs a local passage-evidence retrieval step inside each candidate. Selected-passage Connections likewise needs grouped evidence instead of its current strongest-per-note display projection.
+The whole-note Connections query returns note-level hits without matched passages. The implementation now ranks hydrated stored passage vectors locally against the source vector to obtain anchors. Selected-passage Connections preserves grouped evidence rather than only the strongest-per-note display projection.
 
 ### Passage targets and evidence
 
@@ -150,4 +150,4 @@ Keep the normal controls small: manual on/off, Rerank/Cancel/Use local ranking, 
 
 Show factual outcome counts, for example: “30 notes reranked in one request; source shortened; 18 complete candidate texts and 12 excerpts.” Display actual selected source/anchor counts and an expandable evidence preview. A text-coverage percentage is not a percentage of meaning preserved. Keep original cosine visible alongside model relevance without blending them.
 
-The existing 2.5-second deadline needs a measured replacement for longer inputs. Preserve cancellation, atomic publication and the local fallback. Evaluate long sources, answer-bearing endings/interiors, multilingual notes, large code/tables, many short candidates and a few very long candidates. These recommendations specify the next implementation; this branch's runtime still implements the earlier bounded Search reranker.
+The old 2.5-second deadline has been replaced for longer inputs. Preserve cancellation, atomic publication and the local fallback. Evaluate long sources, answer-bearing endings/interiors, multilingual notes, large code/tables, many short candidates and a few very long candidates. The implementation uses a provisional 20-second remote deadline and 30-second overall preparation/graph deadline. These need real-service latency measurement; they are not a performance guarantee.

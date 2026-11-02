@@ -114,3 +114,7 @@
   .local-semantic-settings .setting-item-control { justify-content: flex-start; width: 100%; max-width: 100%; }
   .local-semantic-settings .setting-item-control > :is(input, textarea, select) { width: 100%; }
 }
+
+.local-semantic-controls input[type="number"] { width: 5em; }
+.local-semantic-evidence-preview { max-height: 30vh; overflow: auto; }
+.local-semantic-evidence-preview pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--font-smaller); }

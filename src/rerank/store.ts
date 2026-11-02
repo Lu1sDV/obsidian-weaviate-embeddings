@@ -5,13 +5,13 @@ import { validateRerankSettings } from "./policy";
 import { defaultRerankSettings, type Provider, type RerankAccess, type RerankSettings } from "./types";
 
 interface SettingsData {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   writeId: string;
   settings: RerankSettings;
   consent: Record<Provider, boolean>;
 }
 interface CredentialData {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   writeId: string;
   openrouterApiKey: string;
 }
@@ -47,9 +47,10 @@ function consent(value: unknown): Record<Provider, boolean> {
   return { openrouter: record.openrouter };
 }
 
-/** Old unmerged builds had another processor and no editable model; preserve only the OR key. */
-function migrateSettings(value: unknown, version: 1 | 2): RerankSettings {
-  if (version === 2) return validateRerankSettings(value);
+/** Expanded source/full-note disclosure requires fresh consent when loading an older format. */
+function migrateSettings(value: unknown, version: 1 | 2 | 3): RerankSettings {
+  if (version === 3) return validateRerankSettings(value);
+  if (version === 2) return validateRerankSettings({ ...validateRerankSettings(value), enabled: false, evidencePassages: 1 });
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid legacy settings");
   const old = value as Record<string, unknown>;
   if (old.provider !== "openrouter" && old.provider !== "typesafe") throw new Error("Invalid legacy provider");
@@ -146,16 +147,16 @@ export class RerankStore {
       if (settingsRaw !== undefined) {
         if (!settingsRaw || typeof settingsRaw !== "object" || Array.isArray(settingsRaw)) throw new Error("Invalid JEV settings file");
         const value = settingsRaw as Partial<SettingsData>;
-        if (value.version !== 1 && value.version !== 2) throw new Error("Invalid rerank settings file");
+        if (value.version !== 1 && value.version !== 2 && value.version !== 3) throw new Error("Invalid rerank settings file");
         settingsWrite = writeIdentity(value.writeId);
         next.settings = migrateSettings(value.settings, value.version);
-        next.consent = value.version === 1 ? { openrouter: false } : consent(value.consent);
+        next.consent = value.version !== 3 ? { openrouter: false } : consent(value.consent);
       }
 
       if (credentialsRaw !== undefined) {
         if (!credentialsRaw || typeof credentialsRaw !== "object" || Array.isArray(credentialsRaw)) throw new Error("Invalid JEV credential file");
         const value = credentialsRaw as Partial<CredentialData>;
-        if (value.version !== 1 && value.version !== 2) throw new Error("Invalid rerank credential file");
+        if (value.version !== 1 && value.version !== 2 && value.version !== 3) throw new Error("Invalid rerank credential file");
         credentialsWrite = writeIdentity(value.writeId);
         next.keys = {
           openrouter: key(value.openrouterApiKey),
@@ -222,13 +223,13 @@ export class RerankStore {
       await chmod(this.directory, 0o700);
       const writeId = crypto.randomUUID();
       const settings: SettingsData = {
-        version: 2,
+        version: 3,
         writeId,
         settings: this.data.settings,
         consent: this.data.consent,
       };
       const credentials: CredentialData = {
-        version: 2,
+        version: 3,
         writeId,
         openrouterApiKey: this.data.keys.openrouter,
       };

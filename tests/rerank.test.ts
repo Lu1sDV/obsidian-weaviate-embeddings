@@ -86,6 +86,14 @@ function serviceWithModel(access: () => RerankAccess, transport: RemoteTransport
 
 function input(candidates: readonly RetrievedNoteCandidate[] = [candidate(0), candidate(1)], patch: Partial<RerankInput> = {}): RerankInput {
   return {
+    source: { kind: "search", title: "", text: patch.query ?? "Evidence", anchors: [] },
+    documents: (patch.candidates ?? candidates).map(item => {
+      let text = "";
+      const anchors = item.passages.map(passage => { const start = text.length; text += passage.body + "\n\n";
+        return { start, end: text.length - 2, passageId: passage.passageId }; });
+      return { title: item.result.title, text, anchors };
+    }),
+    isSourceAllowed: () => true,
     vaultId: "vault",
     generation: 1,
     fingerprint: "fingerprint",
@@ -503,7 +511,7 @@ test("complete cached jobs still recheck policy and exact provenance", async () 
   const edited = candidate(0);
   edited.passages[0]!.body += " Changed.";
   edited.result.passages[0]!.body += " Changed.";
-  await service.run({ ...request, candidates: [edited] });
+  await service.run(input([edited]));
   assert.equal(calls, 6);
 
   access = { ...access, settingsRevision: 1, revision: 1 };
@@ -512,14 +520,14 @@ test("complete cached jobs still recheck policy and exact provenance", async () 
   assert.equal(calls, 7);
 });
 
-test("one failed batch cancels peers and never publishes or caches a partial cohort", async () => {
+test("one failed request never retries, publishes or caches a partial cohort", async () => {
   let calls = 0;
   let fail = true;
   const items = Array.from({ length: 50 }, (_, index) => candidate(index, 1, 1200));
   const transport: RemoteTransport = async options => {
     const call = ++calls;
     await wait(options.signal, call % 2 ? 1 : 5);
-    if (fail && call === 2) throw new RerankError("provider", true);
+    if (fail && call === 1) throw new RerankError("provider", true);
     return response(options);
   };
   const service = serviceWithModel(() => configured(), transport);
@@ -527,6 +535,7 @@ test("one failed batch cancels peers and never publishes or caches a partial coh
   const before = structuredClone(original.candidates);
   const first = await service.run(original);
   assert.equal(first.status, "retained");
+  assert.equal(calls, 1, "no hidden retry or overflow batch");
   assert.deepEqual(original.candidates, before);
   fail = false;
   const second = await service.run(original);
@@ -534,11 +543,11 @@ test("one failed batch cancels peers and never publishes or caches a partial coh
   assert.equal(second.metrics.cacheHits, 0);
 });
 
-test("mixed serving identities reject the complete job", async () => {
+test("an unapproved serving identity rejects the complete one-request job", async () => {
   let count = 0;
   const items = Array.from({ length: 50 }, (_, index) => candidate(index, 1, 1200));
   const service = serviceWithModel(() => configured({ provider: "openrouter" }), async options =>
-    response(options, 0.8, ++count === 1 ? "typesafe/jev-1.13-20260917" : "typesafe/jev-1.13.0"));
+    response(options, 0.8, ++count === 1 ? "typesafe/jev-1.13.0" : "typesafe/jev-1.13-20260917"));
   const outcome = await service.run(input(items, { minimumCandidateCount: 30 }));
   assert.equal(outcome.status, "retained");
   assert.equal(outcome.reason, "model-change");
@@ -586,20 +595,21 @@ test("note-scoped invalidation cancels only affected jobs and preserves unrelate
   assert.equal(calls, 2);
 });
 
-test("two-passage service uses the experimental budget without narrowing the cohort", async () => {
+test("legacy passage count never creates overflow batches in the new runtime", async () => {
   const items = Array.from({ length: 60 }, (_, index) => candidate(index, 2, 800));
-  let calls = 0;
-  const service = serviceWithModel(() => configured({ evidencePassages: 2 }), async options => {
-    calls++;
-    return response(options);
-  });
-  const outcome = await service.run(input(items, { minimumCandidateCount: 30 }));
-  assert.equal(outcome.status, "applied");
-  assert.equal(outcome.metrics.candidateCount, 60);
-  assert.equal(outcome.metrics.evidenceCount, 120);
-  assert.ok(outcome.metrics.requests > LIMITS.maxBatches);
-  assert.ok(outcome.metrics.requests <= LIMITS.twoPassageMaxBatches);
-  assert.equal(calls, outcome.metrics.requests);
+  const outcomes = [];
+  for (const evidencePassages of [1, 2] as const) {
+    let calls = 0;
+    const service = serviceWithModel(() => configured({ evidencePassages, candidateCount: 60 }), async options => {
+      calls++; return response(options);
+    });
+    const outcome = await service.run(input(items));
+    assert.equal(outcome.status, "applied");
+    assert.equal(outcome.metrics.requests, 1); assert.equal(calls, 1);
+    assert.ok(outcome.metrics.candidateCount > 0 && outcome.metrics.candidateCount <= 60);
+    outcomes.push(outcome);
+  }
+  assert.equal(outcomes[0]!.metrics.candidateCount, outcomes[1]!.metrics.candidateCount);
 });
 
 test("global concurrency is two across views and revocation cancels queued work", async () => {
@@ -655,7 +665,7 @@ test("absolute deadline and preflight budget failures retain local results", asy
     await wait(options.signal, 60_000);
     return response(options);
   });
-  const timed = await slow.run(input([candidate(0)]));
+  const timed = await slow.run(input([candidate(0)], { deadlineAt: performance.now() + 30 }));
   assert.equal(timed.status, "retained");
   assert.equal(timed.reason, "deadline");
   assert.ok(timed.metrics.elapsedMs < LIMITS.deadlineMs + 500);
@@ -666,11 +676,11 @@ test("absolute deadline and preflight budget failures retain local results", asy
     return response(options);
   });
   const rejected = await budgeted.run(input(Array.from({ length: 60 }, (_, index) => candidate(index)), {
-    query: "q".repeat(LIMITS.queryBytes + 1),
+    query: "q".repeat(40_000),
     minimumCandidateCount: 30,
   }));
   assert.equal(rejected.status, "retained");
-  assert.equal(rejected.reason, "budget");
+  assert.equal(rejected.reason, "source-too-large");
   assert.equal(calls, 0);
 });
 

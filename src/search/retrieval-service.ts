@@ -36,15 +36,17 @@ export async function expandSearchPool(
   retrieve: (limit: number) => Promise<HybridWindow>,
   admitted: (result: SearchResult) => boolean,
   current: () => boolean,
+  desired = 60,
 ): Promise<ExpandedSearchPool | undefined> {
+  if (!Number.isSafeInteger(desired) || desired < 1 || desired > 60) throw new Error("Invalid reranking candidate count");
   let window = initial;
   let index = SEARCH_WINDOWS.findIndex(limit => limit === window.limit);
   if (index < 0) throw new Error("Invalid saved Search window");
   while (current()) {
-    const pool = admittedCandidates(window, admitted, 60);
+    const pool = admittedCandidates(window, admitted, desired);
     const exhausted = window.passages.length < window.limit || index === SEARCH_WINDOWS.length - 1;
-    if (pool.length === 60 || exhausted) {
-      return { candidates: structuredClone(pool), window: structuredClone(window), candidateExhausted: pool.length < 60 };
+    if (pool.length === desired || exhausted) {
+      return { candidates: structuredClone(pool), window: structuredClone(window), candidateExhausted: pool.length < desired };
     }
     const limit = SEARCH_WINDOWS[++index]!;
     window = await retrieve(limit);
@@ -77,7 +79,8 @@ export class SearchRetrievalService {
     request: SearchRetrievalQuery,
     admitted: (result: SearchResult) => boolean,
     current: () => boolean,
+    desired = 60,
   ): Promise<ExpandedSearchPool | undefined> {
-    return expandSearchPool(initial, limit => this.retrieve(request, limit), admitted, current);
+    return expandSearchPool(initial, limit => this.retrieve(request, limit), admitted, current, desired);
   }
 }

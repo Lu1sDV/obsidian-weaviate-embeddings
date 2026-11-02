@@ -1,3 +1,4 @@
+import { adaptiveLimits } from "./adaptive-plan";
 import { Setting } from "obsidian";
 import type { RerankService } from "./service";
 import type { RerankStore } from "./store";
@@ -15,20 +16,20 @@ export function renderRerankSettings(
 
   root.createEl("h2", { text: "Optional System One reranking" });
   root.createEl("p", {
-    text: "Search only, off by default. Embeddings and Weaviate stay local. A manual action sends the query and selected title/heading/excerpts to the chosen provider. Sent text cannot be recalled. Keys, cloud policy, and provider consent are device-local and outside the vault. File permissions are access control, not encryption.",
+    text: "Off by default. Embeddings and Weaviate stay local. Manual Search or Connections reranking may send the source note or selected passage and complete or extracted candidate notes to the chosen provider. Image destinations are removed; meaningful captions can remain. Linked notes and attachments are never expanded. Sent text cannot be recalled. Keys, cloud policy, and provider consent are device-local and outside the vault. File permissions are access control, not encryption.",
     cls: "setting-item-description",
   });
 
   new Setting(root)
     .setName("Enable manual reranking")
-    .setDesc("Adds the Search action; never uploads while typing, opening a note, or using Connections. No index rebuild.")
+    .setDesc("Adds manual actions in Search and Connections. Enabling, typing and opening notes send nothing. No index rebuild.")
     .addToggle(toggle => toggle.setValue(access.enabled).onChange(enabled => run(async () => {
       await store.configure({ enabled });
       refresh();
     })));
 
   new Setting(root)
-    .setName(`Allow query and excerpt uploads to ${providerName}`)
+    .setName(`Allow source and candidate text uploads to ${providerName}`)
     .setDesc("Changing the model resets this permission because its upstream processor may change. Disabling cancels future requests and clears cached judgments.")
     .addToggle(toggle => toggle.setValue(access.consent).onChange(approved => run(async () => {
       await store.setConsent(access.provider, approved);
@@ -81,7 +82,7 @@ export function renderRerankSettings(
   const model = service.validatedModel;
   if (model) {
     root.createEl("p", {
-      text: `Validated: ${model.requestedModel} → ${model.canonicalSlug}. Catalogue context: ${model.contextTokens.toLocaleString()} tokens. Request packing also keeps the existing application limits and conservative byte headroom; this is not an exact tokenizer count. ${model.fullTextWarning ?? "The synthetic check confirms the request contract, not ranking quality or full-document coverage."}`,
+      text: `Validated: ${model.requestedModel} → ${model.canonicalSlug}. Catalogue context: ${model.contextTokens.toLocaleString()} tokens. One-request planning uses ~${adaptiveLimits(model, access).tokens.toLocaleString()} input tokens under conservative byte guards and applicable per-question limits. This is an estimate, not an exact tokenizer count. ${model.fullTextWarning ?? "The synthetic check confirms the request contract, not ranking quality or full-document coverage."}`,
       cls: "setting-item-description",
     });
   }
@@ -98,7 +99,7 @@ export function renderRerankSettings(
     .addTextArea(input => input.setValue(files).onChange(value => { files = value; }));
   new Setting(root)
     .setName("Apply remote exclusions")
-    .setDesc("Any restricted candidate skips the entire rerank; private notes are never hidden or demoted in local results.")
+    .setDesc("Any restricted source or requested candidate skips the entire rerank; private notes are never hidden or demoted in local results.")
     .addButton(button => button.setButtonText("Apply remote exclusions").onClick(() => run(async () => {
       await store.configure({
         excludedFolders: folders.split("\n").map(value => value.trim()).filter(Boolean),
@@ -107,21 +108,27 @@ export function renderRerankSettings(
       refresh();
     })));
 
-  new Setting(root)
-    .setName("Evidence passages per note")
-    .setDesc("One is the release default. Two is an explicit experiment with more disclosure, cost, and max-score length bias. Two-passage planning keeps the same candidate cohort chosen by the one-passage policy; if that exact cohort cannot fit the experimental budget, reranking is skipped rather than narrowed.")
-    .addDropdown(dropdown => dropdown
-      .addOption("1", "1 — release default")
-      .addOption("2", "2 — experimental")
-      .setValue(String(access.evidencePassages))
-      .onChange(value => run(async () => {
-        if (value !== "1" && value !== "2") return;
-        await store.configure({ evidencePassages: Number(value) as 1 | 2 });
-        refresh();
-      })));
-
+  let candidateCount = String(access.candidateCount), tokenBudget = String(access.tokenBudget);
+  let contextTokens = String(access.contextTokens), contextMode = access.contextMode, policy = access.evidencePolicy;
+  new Setting(root).setName("Desired candidates").setDesc("1–60. The largest leading candidate set that fits useful evidence in one request is judged; at most 30 are displayed.")
+    .addText(input => input.setValue(candidateCount).onChange(value => { candidateCount = value; }));
+  new Setting(root).setName("Evidence policy").setDesc("Auto uses full cleaned text when affordable, otherwise opening/ending and relevant interior extracts. Complete notes only reduces candidate count without shortening candidate notes.")
+    .addDropdown(input => input.addOption("adaptive", "Auto excerpts").addOption("complete", "Complete notes only").setValue(policy)
+      .onChange(value => { if (value === "adaptive" || value === "complete") policy = value; }));
+  new Setting(root).setName("Total request token cap").setDesc("2,048–262,144; default 64,000. Includes source, all candidates and framing. Model limits and conservative byte guards may lower the usable budget substantially. Planning is estimated, not exact tokenization.")
+    .addText(input => input.setValue(tokenBudget).onChange(value => { tokenBudget = value; }));
+  new Setting(root).setName("Surrounding context").setDesc("Auto expands toward 2,048 tokens per side as space permits. Manual uses the preferred per-side ceiling. Multiple anchors share each note's total allowance.")
+    .addDropdown(input => input.addOption("auto", "Auto").addOption("manual", "Manual ceiling").setValue(contextMode)
+      .onChange(value => { if (value === "auto" || value === "manual") contextMode = value; }));
+  new Setting(root).setName("Preferred tokens per side").setDesc("128–8,192; default 512. Context may shrink under the total budget. A selected source passage itself is never silently shortened.")
+    .addText(input => input.setValue(contextTokens).onChange(value => { contextTokens = value; }));
+  new Setting(root).setName("Apply context settings").addButton(button => button.setButtonText("Apply").onClick(() => run(async () => {
+    await store.configure({ candidateCount: Number(candidateCount), tokenBudget: Number(tokenBudget),
+      contextTokens: Number(contextTokens), contextMode, evidencePolicy: policy });
+    refresh();
+  })));
   root.createEl("p", {
-    text: "Limits: up to 60 admitted notes, 30 displayed notes, up to 24 independent candidate-local questions per packed request, two concurrent requests, a 2.5-second remote deadline, and no retries. One-passage planning uses at most 3 batches / 64k estimated tokens. The two-passage experiment uses at most 6 batches / 128k estimated tokens and must keep the same candidate cohort chosen by one-passage planning; otherwise the exact local ranking stays visible. Publication requires complete compatible judgments. The judgment cache is RAM-only with a 15-minute TTL.",
+    text: "At most one inference request per rerank; no overflow batches, automatic retry, or client-side provider fallback. Preparation and publication have a 30-second action deadline; remote work has at most 20 seconds within it. All judgments must validate before publication. Original cosine/hybrid scores stay visible, but are neither sent to the judge nor blended with relevance. The RAM-only scalar cache expires after 15 minutes. Evidence previews are local and cleared on source/settings changes.",
     cls: "setting-item-description",
   });
 }

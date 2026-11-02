@@ -1,31 +1,14 @@
 import { JudgmentCache } from "./cache";
 import { hash } from "./evidence";
+import { planAdaptive, ADAPTIVE_VERSION, type AdaptivePlan } from "./adaptive-plan";
 import { createRemoteTransport, type RemoteTransport } from "./remote-http";
-import { planRerank } from "./planner";
 import { providerFor } from "./providers";
-import { rankNotes } from "./reduce";
-import { packRequests, sameServingIdentity } from "./systemone";
+import { sameServingIdentity } from "./systemone";
 import { DecisionModelError, type ValidatedDecisionModel } from "./model-catalog";
 import { OpenRouterModelRegistry, type ModelRegistry } from "./model-registry";
-import {
-  EVIDENCE_POLICY_VERSION,
-  LIMITS,
-  operationBudget,
-  PRIMITIVE_VERSION,
-  RANKING_POLICY_VERSION,
-  RUBRIC_VERSION,
-  REASON_LABELS,
-  RerankError,
-  type EvidenceRecord,
-  type Provider,
-  type RerankAccess,
-  type RerankInput,
-  type RerankLease,
-  type RerankMetrics,
-  type RerankOutcome,
-  type ServingIdentity,
-} from "./types";
-import type { RetrievedNoteCandidate } from "../weaviate";
+import { LIMITS, REASON_LABELS, RerankError, type Provider, type RerankAccess, type RerankInput,
+  type RerankMetrics, type RerankOutcome, type ServingIdentity } from "./types";
+import type { SearchResult } from "../types";
 
 /** One plugin-wide network lane. Queued aborts are removed before dispatch. */
 class RequestQueue {
@@ -63,33 +46,21 @@ class RequestQueue {
   }
 }
 
-function syntheticCandidate(): RetrievedNoteCandidate {
-  const result = {
-    noteId: "synthetic",
-    snapshotId: "synthetic",
-    path: "",
-    title: "Arithmetic",
-    score: 1,
-    scoreKind: "hybrid" as const,
-    passages: [{ passageId: "synthetic", heading: "Addition", body: "Two plus two equals four.", startLine: 0, endLine: 1 }],
-  };
-  return {
-    result,
-    noteRank: 0,
-    passages: [{
-      noteId: "synthetic",
-      snapshotId: "synthetic",
-      path: "",
-      storedTitle: "Arithmetic",
-      passageId: "synthetic",
-      heading: "Addition",
-      body: "Two plus two equals four.",
-      startLine: 0,
-      endLine: 1,
-      retrievalScore: 1,
-      retrievalRank: 0,
-    }],
-  };
+/** One note-level judgment per candidate; retrieval scores and graph cosines are never modified. */
+export function rankAdaptive(plan: AdaptivePlan, scores: ReadonlyMap<string, number>, serving: ServingIdentity): SearchResult[] {
+  if (scores.size !== plan.records.length || plan.records.some(record => {
+    const value = scores.get(record.key); return value === undefined || !Number.isFinite(value) || value < 0 || value > 1;
+  })) throw new RerankError("invalid-response");
+  return plan.candidates.map((candidate, index) => {
+    const record = plan.records[index]!, result = structuredClone(candidate.result);
+    result.rerank = { ...serving, rubricVersion: plan.rubric, evidencePolicyVersion: ADAPTIVE_VERSION,
+      rankingPolicyVersion: "note-relevance-v2", relevance: scores.get(record.key)!, bestPassageId: record.passageId,
+      evidenceCount: record.selected.ranges.length, coverage: "complete", judgments: [],
+      evidenceCoverage: record.selected.complete ? "full" : "excerpt",
+      sourceCoverage: plan.preview.source.shortened ? "excerpt" : "full" };
+    return { result, index };
+  }).sort((a, b) => b.result.rerank!.relevance - a.result.rerank!.relevance || a.index - b.index)
+    .slice(0, 30).map(item => item.result);
 }
 
 export class RerankService {
@@ -104,292 +75,148 @@ export class RerankService {
   private disposed = false;
   validationProblem: string | null = null;
 
-  constructor(
-    private readonly access: () => RerankAccess,
+  constructor(private readonly access: () => RerankAccess,
     private readonly transport: RemoteTransport = createRemoteTransport(),
-    private readonly models: ModelRegistry = new OpenRouterModelRegistry(),
-  ) {}
+    private readonly models: ModelRegistry = new OpenRouterModelRegistry()) {}
 
-  get validatedModel(): ValidatedDecisionModel | null {
-    return this.models.current(this.access());
-  }
+  get validatedModel(): ValidatedDecisionModel | null { return this.models.current(this.access()); }
 
   invalidate(noteId?: string): void {
     if (noteId) {
-      for (const [job, candidates] of this.jobs) {
-        if (candidates.has(noteId)) job.abort(new RerankError("cancelled"));
-      }
+      for (const [job, notes] of this.jobs) if (notes.has(noteId)) job.abort(new RerankError("cancelled"));
       return;
     }
     this.revision++;
     for (const job of this.jobs.keys()) job.abort(new RerankError("cancelled"));
-    this.cache.clear();
-    this.resolved.clear();
+    this.cache.clear(); this.resolved.clear();
   }
+  dispose(): void { this.disposed = true; this.invalidate(); }
+  run(input: RerankInput): Promise<RerankOutcome> { return this.evaluate(input, false); }
 
-  dispose(): void {
-    this.disposed = true;
-    this.invalidate();
-  }
-
-  run(input: RerankInput): Promise<RerankOutcome> {
-    return this.evaluate(input, false);
-  }
-
-  /** Explicit settings action. Built-in text only; never reads a vault candidate. */
+  /** Explicit synthetic validation uses the same source/candidate/typed-question wire contract. */
   testConnection(signal: AbortSignal): Promise<RerankOutcome> {
-    this.invalidate();
-    this.validationProblem = null;
+    this.invalidate(); this.validationProblem = null;
+    const body = "Two plus two equals four.";
+    const passage = { passageId: "synthetic", heading: "Addition", body, startLine: 0, endLine: 1 };
     return this.evaluate({
-      vaultId: "synthetic",
-      generation: 0,
-      fingerprint: "synthetic",
-      query: "What is two plus two?",
-      queryEpoch: 0,
-      filtersIdentity: "[]",
-      candidates: [syntheticCandidate()],
-      minimumCandidateCount: 1,
-      baselineWindow: 1,
-      candidateWindow: 1,
-      candidateExhausted: true,
-      signal,
-      isCurrent: () => true,
-      isAllowed: () => true,
+      source: { kind: "search", title: "", text: "What is two plus two?", anchors: [] },
+      documents: [{ title: "Arithmetic", text: body, anchors: [{ start: 0, end: body.length, passageId: "synthetic" }] }],
+      isSourceAllowed: () => true,
+      vaultId: "synthetic", generation: 0, fingerprint: "synthetic", query: "What is two plus two?", queryEpoch: 0,
+      filtersIdentity: "[]", minimumCandidateCount: 1, baselineWindow: 1, candidateWindow: 1, candidateExhausted: true,
+      candidates: [{ noteRank: 0,
+        result: { noteId: "synthetic", snapshotId: "synthetic", path: "", title: "Arithmetic", score: 1, scoreKind: "hybrid", passages: [passage] },
+        passages: [{ ...passage, noteId: "synthetic", snapshotId: "synthetic", path: "", storedTitle: "Arithmetic", retrievalScore: 1, retrievalRank: 0 }] }],
+      signal, isCurrent: () => true, isAllowed: () => true,
     }, true);
   }
 
   private async evaluate(original: RerankInput, synthetic: boolean): Promise<RerankOutcome> {
-    const started = performance.now();
-    const timeout = synthetic ? 10_000 : LIMITS.deadlineMs;
-    const deadlineAt = started + timeout;
-    const access = this.access();
-    const routeKey = hash([access.provider, access.model, access.apiKey]);
-    const revision = this.revision;
-    const input = { ...original, candidates: structuredClone(original.candidates) };
+    const started = performance.now(), timeout = synthetic ? 10_000 : LIMITS.deadlineMs;
+    const deadlineAt = Math.min(started + timeout, original.deadlineAt ?? Infinity);
+    const access = this.access(), routeKey = hash([access.provider, access.model, access.apiKey]), revision = this.revision;
+    const input: RerankInput = { ...original, source: structuredClone(original.source),
+      documents: structuredClone(original.documents), candidates: structuredClone(original.candidates) };
     const metrics: RerankMetrics = {
-      route: access.provider,
-      requestedModel: access.model,
-      metricVersion: `${RUBRIC_VERSION}/${EVIDENCE_POLICY_VERSION}/${RANKING_POLICY_VERSION}`,
-      inputCandidateCount: input.candidates.length,
-      candidateCount: 0,
-      baselineWindow: input.baselineWindow,
-      candidateWindow: input.candidateWindow,
-      candidateExhausted: input.candidateExhausted,
-      evidenceCount: 0,
-      truncatedCount: 0,
-      cacheHits: 0,
-      requests: 0,
-      estimatedTokens: 0,
-      inputTokens: 0,
-      outputTokens: 0,
-      cost: 0,
-      elapsedMs: 0,
+      route: access.provider, requestedModel: access.model, metricVersion: ADAPTIVE_VERSION,
+      inputCandidateCount: input.candidates.length, candidateCount: 0, baselineWindow: input.baselineWindow,
+      candidateWindow: input.candidateWindow, candidateExhausted: input.candidateExhausted,
+      evidenceCount: 0, truncatedCount: 0, cacheHits: 0, requests: 0, estimatedTokens: 0,
+      inputTokens: 0, outputTokens: 0, cost: 0, elapsedMs: 0, tokenAccounting: "estimated",
     };
-
     const job = new AbortController();
-    const lease: RerankLease = {
-      sessionId: crypto.randomUUID(),
-      queryEpoch: input.queryEpoch,
-      mode: "search",
-      queryHash: hash(input.query),
-      filtersHash: hash(input.filtersIdentity),
-      generation: input.generation,
-      embeddingFingerprint: input.fingerprint,
-      settingsRevision: access.settingsRevision,
-      cloudPolicyRevision: access.cloudPolicyRevision,
-      consentRevision: access.consentRevision,
-      credentialRevision: access.credentialRevision,
-      baselineWindow: input.baselineWindow,
-      candidateWindow: input.candidateWindow,
-      deadlineAt,
-      signal: job.signal,
-    };
-    const cancel = () => job.abort(new RerankError("cancelled"));
-    if (input.signal.aborted) cancel();
-    else input.signal.addEventListener("abort", cancel, { once: true });
-    const timer = setTimeout(() => job.abort(new RerankError("deadline")), timeout);
-    this.jobs.set(job, new Set(input.candidates.map(candidate => candidate.result.noteId)));
-
+    const cancel = () => job.abort(input.signal.reason instanceof RerankError ? input.signal.reason : new RerankError("cancelled"));
+    if (input.signal.aborted) cancel(); else input.signal.addEventListener("abort", cancel, { once: true });
+    const timer = setTimeout(() => job.abort(new RerankError("deadline")), Math.max(0, deadlineAt - performance.now()));
+    this.jobs.set(job, new Set([...input.candidates.map(candidate => candidate.result.noteId), ...(input.source.noteId ? [input.source.noteId] : [])]));
     const guard = () => {
-      const currentAccess = this.access();
-      if (this.disposed || revision !== this.revision || !input.isCurrent()
-        || currentAccess.model !== access.model || currentAccess.apiKey !== access.apiKey
-        || currentAccess.revision !== access.revision
-        || currentAccess.settingsRevision !== lease.settingsRevision
-        || currentAccess.cloudPolicyRevision !== lease.cloudPolicyRevision
-        || currentAccess.consentRevision !== lease.consentRevision
-        || currentAccess.credentialRevision !== lease.credentialRevision) throw new RerankError("cancelled");
-      if (lease.signal.aborted) {
-        throw lease.signal.reason instanceof RerankError ? lease.signal.reason : new RerankError("cancelled");
-      }
-      if (performance.now() >= lease.deadlineAt) throw new RerankError("deadline");
+      const current = this.access();
+      if (this.disposed || revision !== this.revision || !input.isCurrent() || current.model !== access.model
+        || current.apiKey !== access.apiKey || current.revision !== access.revision
+        || current.settingsRevision !== access.settingsRevision || current.cloudPolicyRevision !== access.cloudPolicyRevision
+        || current.consentRevision !== access.consentRevision || current.credentialRevision !== access.credentialRevision) throw new RerankError("cancelled");
+      if (job.signal.aborted) throw job.signal.reason instanceof RerankError ? job.signal.reason : new RerankError("cancelled");
+      if (performance.now() >= deadlineAt) throw new RerankError("deadline");
       if (!synthetic && !access.enabled) throw new RerankError("off");
       if (!access.apiKey || !access.model) throw new RerankError("unconfigured");
-      if (!synthetic && (!access.consent || !input.candidates.every(input.isAllowed))) throw new RerankError("policy");
+      if (!synthetic && (!access.consent || !input.isSourceAllowed() || !input.candidates.every(input.isAllowed))) throw new RerankError("policy");
     };
-
     try {
       guard();
       if ((this.failures.get(routeKey)?.until ?? 0) > performance.now()) throw new RerankError("circuit-open");
-
-      const model = synthetic ? await this.models.load(access, lease.signal) : this.models.current(access);
+      const model = synthetic ? await this.models.load(access, job.signal) : this.models.current(access);
       guard();
       if (!model) throw new RerankError("model-unverified");
-      const provider = providerFor(model, this.transport);
-      if (provider.requestedModel !== access.model) throw new RerankError("model-change");
-      const plan = planRerank(
-        input.candidates,
-        input.minimumCandidateCount,
-        input.query,
-        model,
-        synthetic ? 1 : access.evidencePassages,
-      );
+      const plan = planAdaptive(input, model, synthetic ? { ...access, candidateCount: 1, evidencePolicy: "adaptive" } : access);
+      guard();
       metrics.candidateCount = plan.candidates.length;
-      metrics.evidenceCount = plan.records.length;
+      metrics.evidenceCount = plan.records.reduce((sum, record) => sum + record.selected.ranges.length, 0);
       metrics.truncatedCount = plan.records.filter(record => record.truncated).length;
-
-      const known = synthetic ? undefined : this.resolved.get(access.provider);
-      const key = (record: EvidenceRecord, serving: ServingIdentity) => hash([
-        input.vaultId,
-        serving.route,
-        serving.requestedModel,
-        serving.servedModel,
-        serving.upstreamProvider ?? "",
-        PRIMITIVE_VERSION,
-        RUBRIC_VERSION,
-        EVIDENCE_POLICY_VERSION,
-        RANKING_POLICY_VERSION,
-        lease.queryHash,
-        lease.filtersHash,
-        lease.mode,
-        lease.generation,
-        lease.embeddingFingerprint,
-        record.noteId,
-        record.snapshotId,
-        record.passageId,
-        record.hash,
-        lease.settingsRevision,
-        lease.cloudPolicyRevision,
-        lease.consentRevision,
-        lease.credentialRevision,
+      metrics.completeCandidateCount = plan.records.length - metrics.truncatedCount;
+      metrics.omittedCandidateCount = input.candidates.length - plan.candidates.length;
+      metrics.omittedAnchorCount = plan.records.reduce((sum, record) => sum + record.selected.omittedAnchors, 0);
+      metrics.sourceTruncated = plan.preview.source.shortened;
+      metrics.inputTokenBudget = plan.budget;
+      metrics.estimatedTokens = plan.batch.estimatedTokens;
+      const key = (question: string, serving: ServingIdentity) => hash([
+        input.vaultId, input.generation, input.fingerprint, input.filtersIdentity, input.query, input.source,
+        plan.fingerprint, serving, access.settingsRevision, access.cloudPolicyRevision, access.consentRevision, access.credentialRevision, question,
       ]);
-
-      const scores = new Map<string, number>();
-      if (known) {
-        for (const record of plan.records) {
+      const known = synthetic ? undefined : this.resolved.get(access.provider);
+      let scores = new Map<string, number>(), serving = known;
+      if (known) for (const record of plan.records) {
+        const value = this.cache.get(key(record.key, known));
+        if (value !== undefined) scores.set(record.key, value);
+      }
+      // Reuse only a complete cohort. Partial cache hits never create mixed comparison contexts.
+      if (scores.size === plan.records.length) metrics.cacheHits = scores.size;
+      else {
+        scores = new Map();
+        const release = await this.queue.acquire(job.signal);
+        try {
+          const beforeSend = () => {
+            guard();
+            if (!synthetic && !this.models.current(this.access())) throw new RerankError("model-unverified");
+          };
+          beforeSend();
+          if (this.requests + 1 > LIMITS.sessionRequests || this.tokens + plan.batch.estimatedTokens > LIMITS.sessionTokens) throw new RerankError("budget");
+          this.requests++; this.tokens += plan.batch.estimatedTokens;
+          metrics.requests = 1; metrics.cost = null;
+          // This is the only inference call in the entire operation. No loops, retries or overflow batches.
+          const response = await providerFor(model, this.transport).evaluate(plan.batch, access.apiKey, job.signal, deadlineAt, beforeSend);
+          metrics.inputTokens = response.inputTokens; metrics.outputTokens = response.outputTokens; metrics.cost = response.cost ?? null;
+          this.tokens += Math.max(0, response.inputTokens - plan.batch.estimatedTokens);
           guard();
-          const score = this.cache.get(key(record, known));
-          if (score !== undefined) scores.set(record.key, score);
-        }
+          if (known && !sameServingIdentity(known, response.servingIdentity)) throw new RerankError("model-change");
+          serving = response.servingIdentity; scores = response.scores;
+        } finally { release(); }
       }
-      metrics.cacheHits = scores.size;
-
-      // The full cohort was admitted by planRerank before cache use. Repack only current misses.
-      const missing = plan.records.filter(record => !scores.has(record.key));
-      const batches = packRequests(model, input.query, missing);
-      metrics.estimatedTokens = batches.reduce((sum, batch) => sum + batch.estimatedTokens, 0);
-      const operation = operationBudget(synthetic ? 1 : access.evidencePassages);
-      if (batches.length > operation.maxBatches || metrics.estimatedTokens > operation.operationTokens) {
-        throw new RerankError("budget");
-      }
-      if (this.requests + batches.length > LIMITS.sessionRequests
-        || this.tokens + metrics.estimatedTokens > LIMITS.sessionTokens) {
-        throw new RerankError("budget");
-      }
-
-      let serving = scores.size ? known : undefined;
-      let next = 0;
-      let pricedResponses = 0;
-      let reportedCost = 0;
-      const worker = async () => {
-        while (next < batches.length) {
-          const batch = batches[next++]!;
-          const release = await this.queue.acquire(job.signal);
-          try {
-            guard();
-            if (this.requests + 1 > LIMITS.sessionRequests
-              || this.tokens + batch.estimatedTokens > LIMITS.sessionTokens) throw new RerankError("budget");
-            this.requests++;
-            this.tokens += batch.estimatedTokens;
-            metrics.requests++;
-            metrics.cost = null;
-
-            const response = await provider.evaluate(batch, access.apiKey, lease.signal, lease.deadlineAt, guard);
-            metrics.inputTokens += response.inputTokens;
-            metrics.outputTokens += response.outputTokens;
-            if (response.cost !== undefined) { reportedCost += response.cost; pricedResponses++; }
-            metrics.cost = pricedResponses === metrics.requests ? reportedCost : null;
-            this.tokens += Math.max(0, response.inputTokens - batch.estimatedTokens);
-            guard();
-
-            if ((known && !sameServingIdentity(known, response.servingIdentity))
-              || (serving && !sameServingIdentity(serving, response.servingIdentity))) {
-              throw new RerankError("model-change");
-            }
-            serving = response.servingIdentity;
-            for (const [candidate, score] of response.scores) scores.set(candidate, score);
-          } catch (error) {
-            job.abort(error instanceof RerankError ? error : new RerankError("provider", true));
-            throw error;
-          } finally {
-            release();
-          }
-        }
-      };
-
-      const work = await Promise.allSettled(
-        Array.from({ length: Math.min(LIMITS.concurrency, batches.length) }, () => worker()),
-      );
-      const failed = work.find((result): result is PromiseRejectedResult => result.status === "rejected");
-      if (failed) throw job.signal.reason ?? failed.reason;
-
       guard();
-      if (!serving || scores.size !== plan.records.length) throw new RerankError("invalid-response");
-      const results = rankNotes(plan.candidates, plan.records, scores, serving);
+      if (!serving) throw new RerankError("invalid-response");
+      const results = rankAdaptive(plan, scores, serving);
       guard();
-
-      if (!synthetic) {
+      if (synthetic) { this.models.approve(access, model); this.resolved.clear(); this.cache.clear(); }
+      else {
         this.resolved.set(access.provider, serving);
-        for (const record of plan.records) this.cache.set(key(record, serving), scores.get(record.key)!);
-      } else {
-        // A successful catalogue lookup is insufficient. Only a complete validated inference
-        // response with our actual state and Noul shape enables this model/key combination.
-        this.models.approve(access, model);
-        this.resolved.delete(access.provider);
-        this.cache.clear();
+        for (const record of plan.records) this.cache.set(key(record.key, serving), scores.get(record.key)!);
       }
       metrics.servedModel = serving.servedModel;
       if (serving.upstreamProvider !== undefined) metrics.upstreamProvider = serving.upstreamProvider;
       this.failures.delete(routeKey);
-      return { status: "applied", results, metrics };
+      return { status: "applied", results, metrics, preview: plan.preview };
     } catch (problem) {
-      const error = problem instanceof RerankError ? problem
-        : new RerankError(problem instanceof DecisionModelError ? "model-invalid" : "provider");
+      const error = problem instanceof RerankError ? problem : new RerankError(problem instanceof DecisionModelError ? "model-invalid" : "provider");
       if (synthetic) this.validationProblem = problem instanceof DecisionModelError ? problem.message : REASON_LABELS[error.reason];
       job.abort(error);
-
-      if (error.reason === "model-change") {
-        this.cache.clear();
-        this.resolved.delete(access.provider);
-      }
-      if (error.reason === "rate-limit") {
-        this.failures.set(routeKey, { count: 3, until: performance.now() + 30_000 });
-      } else if (error.transient || (error.reason === "deadline" && metrics.requests > 0)) {
+      if (error.reason === "model-change") { this.cache.clear(); this.resolved.clear(); }
+      if (error.reason === "rate-limit") this.failures.set(routeKey, { count: 3, until: performance.now() + 30_000 });
+      else if (error.transient || error.reason === "deadline" && metrics.requests > 0) {
         const count = (this.failures.get(routeKey)?.count ?? 0) + 1;
-        this.failures.set(routeKey, {
-          count,
-          until: count >= 3 ? performance.now() + 30_000 : 0,
-        });
+        this.failures.set(routeKey, { count, until: count >= 3 ? performance.now() + 30_000 : 0 });
       }
-      return {
-        status: error.reason === "cancelled" ? "cancelled" : "retained",
-        reason: error.reason,
-        metrics,
-      };
+      return { status: error.reason === "cancelled" ? "cancelled" : "retained", reason: error.reason, metrics };
     } finally {
-      clearTimeout(timer);
-      input.signal.removeEventListener("abort", cancel);
-      this.jobs.delete(job);
+      clearTimeout(timer); input.signal.removeEventListener("abort", cancel); this.jobs.delete(job);
       metrics.elapsedMs = performance.now() - started;
     }
   }
