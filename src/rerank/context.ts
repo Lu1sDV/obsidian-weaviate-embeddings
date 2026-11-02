@@ -1,5 +1,5 @@
 import { estimatedTokens } from "./evidence";
-import { projectMarkdown, type MarkdownProjection, type TextRange } from "./markdown";
+import { projectMarkdown, type MarkdownProjection, type TextBlock, type TextRange } from "./markdown";
 import { DOCUMENT_BYTES, type RerankDocument, type RerankTarget } from "./documents";
 import { RerankError } from "./types";
 
@@ -173,11 +173,34 @@ function around(document: ContextDocument, anchor: TextRange, before: number, af
   ];
 }
 
+/** Sorted non-overlapping Markdown blocks support cheap metadata lookup on long notes. */
+function blockAtStart(blocks: readonly TextBlock[], point: number): TextBlock | undefined {
+  let low = 0, high = blocks.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (blocks[middle]!.end <= point) low = middle + 1;
+    else high = middle;
+  }
+  const block = blocks[low];
+  return block && block.start <= point ? block : undefined;
+}
+
+function blockAtEnd(blocks: readonly TextBlock[], point: number): TextBlock | undefined {
+  let low = 0, high = blocks.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (blocks[middle]!.start < point) low = middle + 1;
+    else high = middle;
+  }
+  const block = blocks[low - 1];
+  return block && block.end >= point ? block : undefined;
+}
+
 function render(document: ContextDocument, ranges: readonly TextRange[], scope: WireDocument["scope"]): SelectedDocument {
   const { text, blocks } = document.projection;
   const structural: TextRange[] = [];
   for (const range of ranges) {
-    const block = blocks.find(block => block.start <= range.start && block.end > range.start);
+    const block = blockAtStart(blocks, range.start);
     if (!block || range.start <= block.start) continue;
     const original = text.slice(block.start, block.end);
     if (block.kind === "table") {
@@ -224,9 +247,9 @@ function render(document: ContextDocument, ranges: readonly TextRange[], scope: 
     && selected.every((range, index) => index === 0 || text.slice(selected[index - 1]!.end, range.start).trim() === "")
     && text.slice(selected.at(-1)!.end).trim() === "";
   const retainedAnchors = document.anchors.filter(anchor => merge(selected).some(range => range.start <= anchor.start && range.end >= anchor.end)).length;
-  const segments = selected.map((range, index): EvidenceSegment => {
-    const block = blocks.find(block => block.end > range.start && block.start <= range.start);
-    const lastBlock = [...blocks].reverse().find(item => item.start < range.end && item.end >= range.end);
+  const rawSegments = selected.map((range, index): EvidenceSegment => {
+    const block = blockAtStart(blocks, range.start);
+    const lastBlock = blockAtEnd(blocks, range.end);
     const focus = document.selected;
     return { role: scope === "passage" && focus
       ? range.start >= focus.start && range.end <= focus.end ? "focus" : "context" : "text",
@@ -236,6 +259,26 @@ function render(document: ContextDocument, ranges: readonly TextRange[], scope: 
     partial: Boolean(block && text.slice(block.start, range.start).trim()
       || lastBlock && text.slice(range.end, lastBlock.end).trim()) };
   });
+  // Compact adjacent paragraphs of the *same* structure/role into one wire segment.
+  // Their original blank lines remain in the text, so the judge still receives
+  // paragraph boundaries without paying repeated question/segment JSON overhead.
+  // Never combine across omitted substantive content, headings, formats or focus.
+  const segments: EvidenceSegment[] = [];
+  const segmentRanges: TextRange[] = [];
+  for (const [index, part] of rawSegments.entries()) {
+    const range = selected[index]!;
+    const previous = segments.at(-1), previousRange = segmentRanges.at(-1);
+    const separator = previousRange ? text.slice(previousRange.end, range.start) : "";
+    if (previous && previousRange && previous.role === part.role && previous.heading === part.heading
+      && previous.format === part.format && separator.length <= 8 && !separator.trim()) {
+      previous.text += separator + part.text;
+      previous.partial ||= part.partial;
+      previousRange.end = range.end;
+    } else {
+      segments.push({ ...part });
+      segmentRanges.push({ ...range });
+    }
+  }
   return { wire: { title: prefix(projectMarkdown(document.original.title).text, 256), scope,
     coverage: complete ? "full" : "excerpt", segments },
   text: segments.map(segment => `${segment.gapBefore ? "[Text omitted]\n" : ""}${segment.role === "focus" ? "[Selected passage]\n" : ""}${segment.text}`).join("\n\n")
@@ -302,8 +345,11 @@ export function selectContext(document: ContextDocument, options: ContextOptions
     if (perSide <= 0) break;
     const selectedAnchor = ranges.find(range => range.start <= anchor.start && range.end >= anchor.end);
     if (!selectedAnchor) continue;
+    // Keep the shared-document check linear in the number of small paragraphs.
+    // Standalone costs conservatively count overlap with previously selected text.
     for (const paragraph of around(document, anchor, perSide, perSide)) {
-      if (totalTokens(text, [...ranges, paragraph]) <= budget) ranges.push(paragraph);
+      const cost = estimatedTokens(text.slice(paragraph.start, paragraph.end));
+      if (cost <= remaining) { ranges.push(paragraph); remaining -= cost; }
     }
     remaining = budget - totalTokens(text, ranges);
   }

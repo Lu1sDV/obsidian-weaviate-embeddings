@@ -276,5 +276,8 @@ test("many tiny paragraph neighbors remain bounded by the shared evidence allowa
   assert.ok(!selected.text.includes("Paragraph before 0."));
   assert.ok(!selected.text.includes("Paragraph after 799."));
   assert.equal(selected.wire.segments.find(part => part.role === "focus")?.text, "EXACT FOCUS");
+  assert.ok(selected.wire.segments.length <= 5, "same-format neighboring paragraphs should not multiply wire segment overhead");
+  assert.ok(selected.wire.segments.some(part => part.role === "context" && /Paragraph before 79\d\.\n\nParagraph before/.test(part.text)),
+    "compacted evidence must preserve original Markdown paragraph boundaries");
   assert.ok(selected.wire.segments.every(segment => segment.text && !segment.text.includes("\ufffd")));
 });
