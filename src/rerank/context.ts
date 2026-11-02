@@ -69,7 +69,7 @@ function merge(ranges: readonly TextRange[]): TextRange[] {
   const result: TextRange[] = [];
   for (const range of [...ranges].filter(range => range.end > range.start).sort((a, b) => a.start - b.start || a.end - b.end)) {
     const previous = result.at(-1);
-    if (previous && range.start <= previous.end + 2) previous.end = Math.max(previous.end, range.end);
+    if (previous && range.start <= previous.end) previous.end = Math.max(previous.end, range.end);
     else result.push({ ...range });
   }
   return result;
@@ -118,13 +118,59 @@ function representativeRanges(document: ContextDocument): TextRange[] {
     blocks[Math.round(index * (blocks.length - 1) / Math.max(1, Math.min(5, blocks.length) - 1))]!);
 }
 
-function around(document: ContextDocument, anchor: TextRange, before: number, after: number): TextRange {
+/**
+ * Add complete Markdown paragraphs closest to a matched span first. The projection's
+ * blocks keep blank-line-separated prose, lists, tables, quotations and fenced code
+ * together; a single soft line break does not create another paragraph. Never cross
+ * the heading that bounds the match. When the next paragraph is too long for the
+ * remaining allowance, take a bounded, Unicode-safe fragment from its near edge.
+ *
+ * Ranges stay separate: we must not accidentally transmit an omitted long paragraph
+ * between two retained blocks. The renderer merges adjacent ranges and labels real gaps.
+ */
+function paragraphSide(document: ContextDocument, anchor: TextRange, tokens: number, side: "before" | "after", boundary: number): TextRange[] {
+  if (tokens <= 0) return [];
+  const { text, blocks } = document.projection;
+  const paragraphs = blocks.filter(block => block.kind !== "heading"
+    && (side === "before" ? block.end > boundary && block.start < anchor.start
+      : block.start < boundary && block.end > anchor.end));
+  if (side === "before") paragraphs.reverse();
+  const ranges: TextRange[] = [];
+  let used = 0;
+  for (const paragraph of paragraphs) {
+    const span = side === "before"
+      ? { start: Math.max(boundary, paragraph.start), end: Math.min(anchor.start, paragraph.end) }
+      : { start: Math.max(anchor.end, paragraph.start), end: Math.min(boundary, paragraph.end) };
+    if (span.end <= span.start || !text.slice(span.start, span.end).trim()) continue;
+    // Sum per-paragraph estimates instead of rescanning the growing selection at
+    // every step. Separate estimates are conservative when adjacent spans merge.
+    const cost = estimatedTokens(text.slice(span.start, span.end));
+    if (used + cost <= tokens) {
+      ranges.push(span);
+      used += cost;
+      continue;
+    }
+    // Only the boundary paragraph is clipped. Earlier, already admitted paragraphs
+    // remain intact; fixed-length clipping is the fallback, not the default.
+    const remaining = tokens - used;
+    if (remaining > 0) {
+      const fragment = clipRange(text, span, remaining, side === "before");
+      if (fragment.end > fragment.start && estimatedTokens(text.slice(fragment.start, fragment.end)) <= remaining) ranges.push(fragment);
+    }
+    break;
+  }
+  return ranges;
+}
+
+function around(document: ContextDocument, anchor: TextRange, before: number, after: number): TextRange[] {
   const { text, blocks } = document.projection;
   const preceding = [...blocks].reverse().find(block => block.kind === "heading" && block.end <= anchor.start);
   const following = blocks.find(block => block.kind === "heading" && block.start >= anchor.end);
   const left = preceding?.end ?? 0, right = following?.start ?? text.length;
-  return { start: anchor.start - suffix(text.slice(left, anchor.start), before * 2).length,
-    end: anchor.end + prefix(text.slice(anchor.end, right), after * 2).length };
+  return [
+    ...paragraphSide(document, anchor, before, "before", left),
+    ...paragraphSide(document, anchor, after, "after", right),
+  ];
 }
 
 function render(document: ContextDocument, ranges: readonly TextRange[], scope: WireDocument["scope"]): SelectedDocument {
@@ -173,7 +219,9 @@ function render(document: ContextDocument, ranges: readonly TextRange[], scope: 
       ];
     }).filter(range => range.end > range.start && text.slice(range.start, range.end).trim());
   }
-  const complete = merge(selected).length === 1 && text.slice(0, selected[0]!.start).trim() === ""
+  // Whitespace-only separators between retained paragraphs are not missing content.
+  const complete = text.slice(0, selected[0]!.start).trim() === ""
+    && selected.every((range, index) => index === 0 || text.slice(selected[index - 1]!.end, range.start).trim() === "")
     && text.slice(selected.at(-1)!.end).trim() === "";
   const retainedAnchors = document.anchors.filter(anchor => merge(selected).some(range => range.start <= anchor.start && range.end >= anchor.end)).length;
   const segments = selected.map((range, index): EvidenceSegment => {
@@ -184,7 +232,9 @@ function render(document: ContextDocument, ranges: readonly TextRange[], scope: 
       ? range.start >= focus.start && range.end <= focus.end ? "focus" : "context" : "text",
     heading: prefix(block?.heading ?? "", 512), format: block && range.end <= block.end ? block.kind : "markdown", text: text.slice(range.start, range.end),
     gapBefore: Boolean(text.slice(index ? selected[index - 1]!.end : 0, range.start).trim()),
-    partial: Boolean(block && range.start > block.start || lastBlock && range.end < lastBlock.end) };
+    // Trimming the newline at a complete paragraph boundary is not truncation.
+    partial: Boolean(block && text.slice(block.start, range.start).trim()
+      || lastBlock && text.slice(range.end, lastBlock.end).trim()) };
   });
   return { wire: { title: prefix(projectMarkdown(document.original.title).text, 256), scope,
     coverage: complete ? "full" : "excerpt", segments },
@@ -252,8 +302,9 @@ export function selectContext(document: ContextDocument, options: ContextOptions
     if (perSide <= 0) break;
     const selectedAnchor = ranges.find(range => range.start <= anchor.start && range.end >= anchor.end);
     if (!selectedAnchor) continue;
-    const window = around(document, anchor, perSide, perSide);
-    ranges.push(window);
+    for (const paragraph of around(document, anchor, perSide, perSide)) {
+      if (totalTokens(text, [...ranges, paragraph]) <= budget) ranges.push(paragraph);
+    }
     remaining = budget - totalTokens(text, ranges);
   }
   const result = render(document, ranges, options.scope);

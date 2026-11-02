@@ -5,7 +5,7 @@ import type { RequestBatch } from "./systemone";
 import { LIMITS, RerankError, type EvidenceRecord, type RerankInput, type RerankSettings, type RerankPreview } from "./types";
 import type { RetrievedNoteCandidate } from "../weaviate";
 
-export const ADAPTIVE_VERSION = "single-request-context-v1";
+export const ADAPTIVE_VERSION = "single-request-paragraph-context-v2";
 export const RELATED_RUBRIC = "useful-related-noul-v1";
 export const SEARCH_RUBRIC = "search-relevance-noul-v2";
 export interface AdaptiveRecord extends EvidenceRecord { selected: SelectedDocument }

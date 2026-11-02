@@ -38,3 +38,11 @@ No funded inference or real-vault text upload was performed in this review. Vali
 Exact per-model tokenization and provider framing remain unverified. The conservative estimate/byte envelope deliberately underuses some advertised context and cannot certify complete provider reading. The Markdown scanner supports the tested structural subset, not every extension; inspect the local evidence preview for unusual syntax. The 20-second network/30-second total deadlines are provisional and need measurement.
 
 No unresolved defect from the reproduced regression set remains. That is not a claim that further defects are impossible. Existing embedding/indexing behavior and schema were intentionally left unchanged.
+
+## Follow-up: Markdown paragraph-first surrounding context (2026-11-03)
+
+The previous context window consumed fixed byte offsets even when neighboring Markdown paragraphs fit in full. The follow-up selector now admits nearest complete paragraph blocks within the current heading section, retaining blank-line-separated prose (including soft line breaks), fenced code, lists, tables and quotations as logical units. If the next block is too large, it clips only that boundary block from the edge nearest the focus. No distant block is admitted by skipping a large near block.
+
+The review also fixed two metadata edge cases: blank-line-separated paragraphs should not be merged into one format-ambiguous segment, and stripping a trailing paragraph newline should not label a complete paragraph as partial. Whitespace-only separators are not treated as missing content when calculating full-text coverage. A new adaptive evidence version prevents reuse of cached judgments under the previous context-selection policy.
+
+Regressions cover whole paragraph retention, oversized-neighbor fallback, non-crossing heading boundaries, fenced code with internal blank lines, list/table behavior inherited from the previous review, and no skipping past an oversized neighbor. Existing one-request budgeting, focus preservation and conservative final serialized guards remain unchanged. See the follow-up commit and CI results for the final test count.
