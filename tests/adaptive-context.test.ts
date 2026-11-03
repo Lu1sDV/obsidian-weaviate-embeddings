@@ -194,3 +194,90 @@ test("an extracted nested list retains its parent item", () => {
 test("very high line counts are bounded before allocating an unbounded projection", () => {
   assert.throws(() => projectMarkdown("\n".repeat(50_001)), (error: unknown) => error instanceof RerankError && error.reason === "budget");
 });
+
+test("surrounding evidence admits complete Markdown paragraphs, not arbitrary byte tails", () => {
+  const first = "FIRST BEFORE paragraph is short enough to retain in full.\nIts soft-wrapped line remains in the same paragraph.";
+  const near = "NEAR BEFORE paragraph stays whole, not clipped in half.";
+  const focus = "FOCUS: the selected claim.";
+  const after = "NEAR AFTER paragraph stays whole, even when multiple candidates compete.";
+  const text = `## Previous\n\nPRIVATE OLD SECTION ${"old ".repeat(500)}\n\n## Relevant\n\n${first}\n\n${near}\n\n${focus}\n\n${after}\n\n## Next\n\nPRIVATE NEXT SECTION ${"next ".repeat(500)}`;
+  const start = text.indexOf(focus);
+  const selected = selectContext(prepareContext({ kind: "passage", title: "Paragraphs", text,
+    anchors: [], selected: { start, end: start + focus.length } }),
+  { scope: "passage", tokens: 500, contextTokens: 150, source: true });
+  assert.equal(selected.wire.segments.find(part => part.role === "focus")?.text, focus);
+  assert.ok(selected.text.includes(first), selected.text);
+  assert.ok(selected.text.includes(near), selected.text);
+  assert.ok(selected.text.includes(after), selected.text);
+  assert.ok(!selected.text.includes("PRIVATE OLD SECTION") && !selected.text.includes("PRIVATE NEXT SECTION"));
+  assert.ok(selected.wire.segments.filter(part => part.role === "context").every(part => !part.partial));
+});
+
+test("a too-long neighboring paragraph falls back to fixed-length text nearest the focus", () => {
+  const focus = "FOCUS claim";
+  const text = `# Relevant\n\nDISTANT START ${"earlier ".repeat(200)}\nNEAR BEFORE TERMINUS\n\n${focus}\n\nNEAR AFTER ORIGIN ${"later ".repeat(200)} DISTANT END\n\n## Other\n\nNEVER CROSS HEADING`;
+  const start = text.indexOf(focus);
+  const selected = selectContext(prepareContext({ kind: "passage", title: "Long paragraphs", text,
+    anchors: [], selected: { start, end: start + focus.length } }),
+  { scope: "passage", tokens: 250, contextTokens: 60, source: true });
+  assert.match(selected.text, /NEAR BEFORE TERMINUS/);
+  assert.match(selected.text, /NEAR AFTER ORIGIN/);
+  assert.ok(!selected.text.includes("DISTANT START") && !selected.text.includes("DISTANT END"), selected.text);
+  assert.ok(!selected.text.includes("NEVER CROSS HEADING"), selected.text);
+  assert.ok(selected.wire.segments.some(part => part.role === "context" && part.partial));
+  assert.ok(!selected.text.includes("\ufffd"));
+});
+
+test("Markdown fenced code with blank lines stays a whole neighboring block when affordable", () => {
+  const code = "```ts\nconst first = 1;\n\nconst second = 2;\n```";
+  const focus = "SELECTED FOCUS";
+  const text = `# Relevant\n\n${code}\n\n${focus}\n\n## Other\n\n${"unrelated ".repeat(300)}`;
+  const start = text.indexOf(focus);
+  const selected = selectContext(prepareContext({ kind: "passage", title: "Code", text,
+    anchors: [], selected: { start, end: start + focus.length } }),
+  { scope: "passage", tokens: 160, contextTokens: 70, source: true });
+  assert.ok(selected.wire.segments.some(part => part.role === "context" && part.text.includes(code) && part.format === "code"), selected.text);
+  assert.ok(!selected.text.includes("unrelated"), selected.text);
+});
+
+test("neighbor context stops on the first oversized paragraph without skipping ahead for smaller ones", () => {
+  const focus = "FOCUS";
+  const text = `# Topic\n\nSHOULD NOT SKIP HERE\n\n${"very large neighbor ".repeat(200)} NEAR ANCHOR\n\n${focus}\n\n${"also large ".repeat(200)}\n\nSHOULD NOT JUMP AHEAD`;
+  const start = text.indexOf(focus);
+  const selected = selectContext(prepareContext({ kind: "passage", title: "Stop", text,
+    anchors: [], selected: { start, end: start + focus.length } }),
+  { scope: "passage", tokens: 250, contextTokens: 45, source: true });
+  assert.ok(selected.text.includes("NEAR ANCHOR"));
+  assert.ok(!selected.text.includes("SHOULD NOT SKIP HERE") && !selected.text.includes("SHOULD NOT JUMP AHEAD"), selected.text);
+});
+
+test("complete paragraph coverage does not treat blank-line separators as omitted content", () => {
+  const text = "FIRST PARAGRAPH.\n\nFOCUS.\n\nLAST PARAGRAPH.";
+  const start = text.indexOf("FOCUS");
+  const selected = selectContext(prepareContext({ kind: "passage", title: "Coverage", text,
+    anchors: [], selected: { start, end: start + 6 } }),
+  { scope: "passage", tokens: 140, contextTokens: 50, source: true });
+  assert.equal(selected.complete, true);
+  assert.equal(selected.wire.coverage, "full");
+  assert.ok(!selected.text.includes("[Text omitted]"), selected.text);
+  assert.ok(selected.wire.segments.every(segment => !segment.partial));
+});
+
+test("many tiny paragraph neighbors remain bounded by the shared evidence allowance", () => {
+  const before = Array.from({ length: 800 }, (_, index) => `Paragraph before ${index}.`).join("\n\n");
+  const after = Array.from({ length: 800 }, (_, index) => `Paragraph after ${index}.`).join("\n\n");
+  const text = `# Relevant\n\n${before}\n\nEXACT FOCUS\n\n${after}`;
+  const start = text.indexOf("EXACT FOCUS");
+  const selected = selectContext(prepareContext({ kind: "passage", title: "Many short paragraphs", text,
+    anchors: [], selected: { start, end: start + "EXACT FOCUS".length } }),
+  { scope: "passage", tokens: 600, contextTokens: 300, source: true });
+  assert.ok(selected.text.includes("Paragraph before 799."));
+  assert.ok(selected.text.includes("Paragraph after 0."));
+  assert.ok(!selected.text.includes("Paragraph before 0."));
+  assert.ok(!selected.text.includes("Paragraph after 799."));
+  assert.equal(selected.wire.segments.find(part => part.role === "focus")?.text, "EXACT FOCUS");
+  assert.ok(selected.wire.segments.length <= 5, "same-format neighboring paragraphs should not multiply wire segment overhead");
+  assert.ok(selected.wire.segments.some(part => part.role === "context" && /Paragraph before 79\d\.\n\nParagraph before/.test(part.text)),
+    "compacted evidence must preserve original Markdown paragraph boundaries");
+  assert.ok(selected.wire.segments.every(segment => segment.text && !segment.text.includes("\ufffd")));
+});
